@@ -21,18 +21,21 @@ Moving work out of the request path improves responsiveness and isolates transie
 
 ```mermaid
 flowchart TB
-    Client[Client] -->|POST /enqueue| Producer[Producer HTTP API]
-    Client -->|GET /jobs/{id}, /dlq, /metrics| Producer
-    Producer --> Metadata[(task:{jobID})]
-    Producer --> Priority[(task_priority_queue)]
-    Producer --> Schedule[(task_schedule_queue)]
+    Client[Client] -->|POST enqueue| Producer[Producer HTTP API]
+    Client -->|GET job by ID| Producer
+    Client -->|GET DLQ| Producer
+    Client -->|GET metrics| Producer
+
+    Producer --> Metadata[(task job metadata)]
+    Producer --> Priority[(task priority queue)]
+    Producer --> Schedule[(task schedule queue)]
 
     subgraph Redis[Redis]
         Priority
-        Processing[task_processing]
-        Retry[task_retry_queue]
+        Processing[task processing]
+        Retry[task retry queue]
         Schedule
-        DLQ[task_dlq]
+        DLQ[task DLQ]
         Metadata
     end
 
@@ -45,13 +48,13 @@ flowchart TB
 
     Priority -->|atomic Lua claim| Processing
     Processing --> Pool
-    Pool -->|success + ACK| Completed[completed metadata]
+    Pool -->|success and ACK| Completed[completed metadata]
     Pool -->|application failure| Retry
     RetryScheduler -->|eligible retry| Priority
     Pool -->|attempts exhausted| DLQ
     DLQ --> Dead[dead metadata]
     ScheduleScheduler -->|due job| Priority
-    Processing -->|worker crash / expired lease| Recovery
+    Processing -->|worker crash or expired lease| Recovery
     Recovery --> Priority
 ```
 
