@@ -1,0 +1,12 @@
+.git
+.github
+.codex
+.agents
+work
+logs.txt
+*.log
+*.env
+image*.png
+WorkQueue.png
+README.md
+docs

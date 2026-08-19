@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: Install race-detector compiler toolchain
+        run: sudo apt-get update && sudo apt-get install --yes build-essential
+
+      - name: Verify Go formatting
+        run: test -z "$(find . -name '*.go' -not -path './work/*' -print0 | xargs -0 gofmt -l)"
+
+      - name: Run unit and integration tests
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: go test ./...
+
+      - name: Run race detector
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: go test -race ./...
+
+      - name: Build Go binaries
+        run: go build ./...
+
+      - name: Build producer image
+        run: docker build --file Dockerfile.producer --tag taskforge-producer:ci .
+
+      - name: Build worker image
+        run: docker build --file Dockerfile.worker --tag taskforge-worker:ci .

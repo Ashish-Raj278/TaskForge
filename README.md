@@ -119,3 +119,7 @@ Example:
 ---
 
 Created by - [Abhinav Jha](https://x.com/AbhinavXJ)
+## Deployment
+
+Deployment, Docker Compose, configuration, health checks, and CI details are in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

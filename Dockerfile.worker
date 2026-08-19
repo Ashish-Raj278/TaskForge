@@ -1,0 +1,18 @@
+FROM golang:1.23-alpine AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/taskforge-worker ./cmd/worker
+
+FROM alpine:3.20
+
+RUN addgroup -S taskforge && adduser -S -G taskforge taskforge
+COPY --from=build /out/taskforge-worker /usr/local/bin/taskforge-worker
+
+USER taskforge
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/taskforge-worker"]
