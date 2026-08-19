@@ -58,7 +58,7 @@ func TestClaimMovesTaskToProcessingAndRecoveryRestoresPending(t *testing.T) {
 	if claimedTask.ID != taskToRecover.ID {
 		t.Fatalf("claimed task ID = %s, want %s", claimedTask.ID, taskToRecover.ID)
 	}
-	if got := rdb.LLen(ctx, queue).Val(); got != 0 {
+	if got := rdb.ZCard(ctx, queue).Val(); got != 0 {
 		t.Fatalf("queued tasks = %d, want 0", got)
 	}
 	if !contains(ctx, rdb, ProcessingQueue, rawTask) {
@@ -89,7 +89,7 @@ func TestClaimMovesTaskToProcessingAndRecoveryRestoresPending(t *testing.T) {
 	if contains(ctx, rdb, ProcessingQueue, rawTask) {
 		t.Fatal("recovered task remained in the processing queue")
 	}
-	if got := rdb.LLen(ctx, queue).Val(); got != 1 {
+	if got := rdb.ZCard(ctx, queue).Val(); got != 1 {
 		t.Fatalf("queued tasks = %d, want 1", got)
 	}
 }

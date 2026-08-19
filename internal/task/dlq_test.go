@@ -68,13 +68,13 @@ func TestMoveToDLQAndReplay(t *testing.T) {
 	if matches := countDLQEntries(ctx, rdb, queuedTask.ID); matches != 0 {
 		t.Fatalf("DLQ occurrences after replay = %d, want 0", matches)
 	}
-	if got := rdb.LLen(ctx, queue).Val(); got != 1 {
+	if got := rdb.ZCard(ctx, queue).Val(); got != 1 {
 		t.Fatalf("queue length = %d, want 1", got)
 	}
 	if _, err := ReplayDeadTask(ctx, rdb, queue, queuedTask.ID); err == nil {
 		t.Fatal("duplicate replay succeeded")
 	}
-	if got := rdb.LLen(ctx, queue).Val(); got != 1 {
+	if got := rdb.ZCard(ctx, queue).Val(); got != 1 {
 		t.Fatalf("queue length after duplicate replay = %d, want 1", got)
 	}
 }

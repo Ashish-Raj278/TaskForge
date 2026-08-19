@@ -18,26 +18,6 @@ func MetadataKey(id string) string {
 	return MetadataKeyPrefix + id
 }
 
-// StoreAndEnqueue saves task metadata and appends the task to the execution queue atomically.
-func StoreAndEnqueue(ctx context.Context, rdb *redis.Client, queue string, task Task) (int64, error) {
-	serializedTask, err := json.Marshal(task)
-	if err != nil {
-		return 0, fmt.Errorf("marshal task metadata: %w", err)
-	}
-
-	var queueLength *redis.IntCmd
-	_, err = rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		pipe.Set(ctx, MetadataKey(task.ID), serializedTask, 0)
-		queueLength = pipe.RPush(ctx, queue, serializedTask)
-		return nil
-	})
-	if err != nil {
-		return 0, fmt.Errorf("store and enqueue task: %w", err)
-	}
-
-	return queueLength.Val(), nil
-}
-
 func GetMetadata(ctx context.Context, rdb *redis.Client, id string) (Task, error) {
 	task, _, err := getMetadata(ctx, rdb, id)
 	return task, err

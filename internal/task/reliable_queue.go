@@ -12,10 +12,19 @@ import (
 
 const ProcessingQueue = "task_processing"
 
-func Claim(ctx context.Context, rdb *redis.Client, queue string, timeout time.Duration) (string, Task, error) {
-	raw, err := rdb.BLMove(ctx, queue, ProcessingQueue, "LEFT", "RIGHT", timeout).Result()
+// Claim atomically moves the highest-priority pending task to processing.
+// A missing task returns redis.Nil; callers use their cancellation-aware poll interval.
+func Claim(ctx context.Context, rdb *redis.Client, queue string, _ time.Duration) (string, Task, error) {
+	result, err := rdb.Eval(ctx, claimPriorityScript, []string{queue, ProcessingQueue}).Result()
 	if err != nil {
 		return "", Task{}, err
+	}
+	if result == nil {
+		return "", Task{}, redis.Nil
+	}
+	raw, ok := result.(string)
+	if !ok {
+		return "", Task{}, fmt.Errorf("claim task: unexpected Redis result %T", result)
 	}
 
 	var task Task
@@ -75,7 +84,7 @@ func RecoverAbandoned(ctx context.Context, rdb *redis.Client, queue string, visi
 			return recovered, fmt.Errorf("marshal recovered metadata: %w", err)
 		}
 
-		result, err := rdb.Eval(ctx, recoverScript, []string{ProcessingQueue, queue, MetadataKey(task.ID)}, rawTask, string(metadata), string(updatedMetadata)).Int()
+		result, err := rdb.Eval(ctx, recoverScript, []string{ProcessingQueue, queue, PrioritySequenceKey(queue), MetadataKey(task.ID)}, rawTask, string(metadata), string(updatedMetadata), task.Priority).Int()
 		if err != nil {
 			return recovered, fmt.Errorf("recover processing task: %w", err)
 		}
@@ -85,14 +94,26 @@ func RecoverAbandoned(ctx context.Context, rdb *redis.Client, queue string, visi
 	return recovered, nil
 }
 
+const claimPriorityScript = `
+local popped = redis.call('ZPOPMIN', KEYS[1], 1)
+if #popped == 0 then
+  return false
+end
+local raw = string.sub(popped[1], 22)
+redis.call('RPUSH', KEYS[2], raw)
+return raw
+`
+
 const recoverScript = `
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then
   return 0
 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
-redis.call('SET', KEYS[3], ARGV[3])
-redis.call('RPUSH', KEYS[2], ARGV[1])
+local sequence = redis.call('INCR', KEYS[3])
+local member = string.format('%020d', sequence) .. '|' .. ARGV[1]
+redis.call('SET', KEYS[4], ARGV[3])
+redis.call('ZADD', KEYS[2], -tonumber(ARGV[4]), member)
 return 1
 `

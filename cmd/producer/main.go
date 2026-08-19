@@ -24,10 +24,11 @@ var ctx = context.Background()
 const defaultDLQListLimit int64 = 100
 
 type enqueueRequest struct {
-	Type       string                 `json:"type"`
-	Payload    map[string]interface{} `json:"payload"`
-	Priority   *int                   `json:"priority"`
-	MaxRetries *int                   `json:"max_retries"`
+	Type        string                 `json:"type"`
+	Payload     map[string]interface{} `json:"payload"`
+	Priority    *int                   `json:"priority"`
+	MaxRetries  *int                   `json:"max_retries"`
+	ScheduledAt *time.Time             `json:"scheduled_at"`
 }
 
 func connectRedis() *redis.Client {
@@ -111,18 +112,34 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queuedTask := task.Task{
-		ID:         id,
-		Type:       request.Type,
-		Payload:    request.Payload,
-		Status:     task.StatusPending,
-		Priority:   priority,
-		MaxRetries: maxRetries,
-		Attempts:   0,
-		CreatedAt:  time.Now().UTC(),
+	var scheduledAt *time.Time
+	if request.ScheduledAt != nil {
+		utcScheduledAt := request.ScheduledAt.UTC()
+		scheduledAt = &utcScheduledAt
 	}
 
-	queueLength, err := task.StoreAndEnqueue(ctx, rdb, "task_queue", queuedTask)
+	queuedTask := task.Task{
+		ID:          id,
+		Type:        request.Type,
+		Payload:     request.Payload,
+		Status:      task.StatusPending,
+		Priority:    priority,
+		MaxRetries:  maxRetries,
+		Attempts:    0,
+		CreatedAt:   time.Now().UTC(),
+		ScheduledAt: scheduledAt,
+	}
+
+	if queuedTask.ScheduledAt != nil && queuedTask.ScheduledAt.After(time.Now().UTC()) {
+		if err := task.StoreAndSchedule(ctx, rdb, queuedTask); err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "Task of type '%s' has been successfully scheduled", queuedTask.Type)
+		return
+	}
+
+	queueLength, err := task.StoreAndEnqueue(ctx, rdb, task.PriorityQueue, queuedTask)
 	if err != nil {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
@@ -207,7 +224,7 @@ func retryDLQHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	replayedTask, err := task.ReplayDeadTask(ctx, rdb, "task_queue", id)
+	replayedTask, err := task.ReplayDeadTask(ctx, rdb, task.PriorityQueue, id)
 	if errors.Is(err, task.ErrNotFound) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)

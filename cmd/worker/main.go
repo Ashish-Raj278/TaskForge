@@ -32,7 +32,7 @@ func main() {
 	workerCount := worker.WorkerCount(os.Getenv("WORKER_COUNT"))
 	visibilityTimeout := worker.VisibilityTimeout(os.Getenv("TASK_VISIBILITY_TIMEOUT"))
 	retryBaseDelay := worker.RetryBaseDelay(os.Getenv("TASK_RETRY_BASE_DELAY"))
-	pool := worker.NewPool(rdb, "task_queue", workerCount, visibilityTimeout, retryBaseDelay, log.Default())
+	pool := worker.NewPool(rdb, task.PriorityQueue, workerCount, visibilityTimeout, retryBaseDelay, log.Default())
 	workerContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerDone := make(chan struct{})

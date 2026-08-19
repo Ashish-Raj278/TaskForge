@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	DefaultWorkerCount       = 3
-	DefaultVisibilityTimeout = 30 * time.Second
-	DefaultRetryBaseDelay    = 2 * time.Second
-	defaultPollTimeout       = time.Second
-	retrySchedulerInterval   = 500 * time.Millisecond
+	DefaultWorkerCount        = 3
+	DefaultVisibilityTimeout  = 30 * time.Second
+	DefaultRetryBaseDelay     = 2 * time.Second
+	defaultPollTimeout        = time.Second
+	retrySchedulerInterval    = 500 * time.Millisecond
+	scheduleSchedulerInterval = 500 * time.Millisecond
 )
 
 type Stats struct {
@@ -99,12 +100,38 @@ func (p *Pool) Run(ctx context.Context) {
 	go p.runRecovery(ctx, &wg)
 	wg.Add(1)
 	go p.runRetryScheduler(ctx, &wg)
+	wg.Add(1)
+	go p.runScheduleScheduler(ctx, &wg)
 
 	for workerID := 1; workerID <= p.workerCount; workerID++ {
 		wg.Add(1)
 		go p.runWorker(ctx, workerID, &wg)
 	}
 	wg.Wait()
+}
+
+func (p *Pool) runScheduleScheduler(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(scheduleSchedulerInterval)
+	defer ticker.Stop()
+
+	p.logger.Println("scheduled-job scheduler started")
+	defer p.logger.Println("scheduled-job scheduler stopped")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			moved, err := task.MoveDueScheduled(ctx, p.rdb, p.queue, time.Now().UTC())
+			if err != nil {
+				p.logger.Printf("scheduled-job scheduler error: %v", err)
+				continue
+			}
+			if moved > 0 {
+				p.logger.Printf("returned %d scheduled task(s) to the priority queue", moved)
+			}
+		}
+	}
 }
 
 func (p *Pool) Stats() Stats {
@@ -126,6 +153,15 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 				return
 			}
 			if errors.Is(err, redis.Nil) {
+				pollTimer := time.NewTimer(defaultPollTimeout)
+				select {
+				case <-ctx.Done():
+					if !pollTimer.Stop() {
+						<-pollTimer.C
+					}
+					return
+				case <-pollTimer.C:
+				}
 				continue
 			}
 			p.logger.Printf("worker %d stopped after Redis error: %v", workerID, err)
@@ -234,7 +270,7 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (p *Pool) updateQueueLength(workerID int) {
-	queueLength, err := p.rdb.LLen(context.Background(), p.queue).Result()
+	queueLength, err := p.rdb.ZCard(context.Background(), p.queue).Result()
 	if err != nil {
 		p.logger.Printf("worker %d could not read queue length: %v", workerID, err)
 		return

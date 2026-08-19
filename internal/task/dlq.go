@@ -101,7 +101,7 @@ func ReplayDeadTask(ctx context.Context, rdb *redis.Client, queue, id string) (T
 		return Task{}, fmt.Errorf("marshal replay task: %w", err)
 	}
 
-	result, err := rdb.Eval(ctx, replayDeadTaskScript, []string{DeadLetterQueue, queue, MetadataKey(id)}, id, string(metadata), string(updatedMetadata), string(queuedTask)).Int()
+	result, err := rdb.Eval(ctx, replayDeadTaskScript, []string{DeadLetterQueue, queue, PrioritySequenceKey(queue), MetadataKey(id)}, id, string(metadata), string(updatedMetadata), string(queuedTask), task.Priority).Int()
 	if err != nil {
 		return Task{}, fmt.Errorf("replay dead task: %w", err)
 	}
@@ -120,18 +120,20 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
 end
 redis.call('SET', KEYS[3], ARGV[3])
 redis.call('LREM', KEYS[2], 0, ARGV[4])
-redis.call('RPUSH', KEYS[2], ARGV[4])
+redis.call('LPUSH', KEYS[2], ARGV[4])
 return 1
 `
 
 const replayDeadTaskScript = `
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then
   return 0
 end
 if redis.call('LREM', KEYS[1], 0, ARGV[1]) == 0 then
   return 0
 end
-redis.call('SET', KEYS[3], ARGV[3])
-redis.call('RPUSH', KEYS[2], ARGV[4])
+local sequence = redis.call('INCR', KEYS[3])
+local member = string.format('%020d', sequence) .. '|' .. ARGV[4]
+redis.call('SET', KEYS[4], ARGV[3])
+redis.call('ZADD', KEYS[2], -tonumber(ARGV[5]), member)
 return 1
 `

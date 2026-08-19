@@ -8,11 +8,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+func TestEnqueueRejectsInvalidScheduledAt(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/enqueue", strings.NewReader(`{"type":"generate_pdf","scheduled_at":"not-a-timestamp","payload":{}}`))
+	response := httptest.NewRecorder()
+	post_handler(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("POST /enqueue invalid scheduled_at status = %d, want 400", response.Code)
+	}
+}
 
 func producerRedis(t *testing.T) *redis.Client {
 	t.Helper()

@@ -104,7 +104,7 @@ func MoveDueRetries(ctx context.Context, rdb *redis.Client, queue string, now ti
 			return moved, fmt.Errorf("marshal eligible retry task: %w", err)
 		}
 
-		result, err := rdb.Eval(ctx, moveDueRetryScript, []string{RetryQueue, queue, MetadataKey(id)}, id, string(metadata), string(updatedMetadata), string(queuedTask)).Int()
+		result, err := rdb.Eval(ctx, moveDueRetryScript, []string{RetryQueue, queue, PrioritySequenceKey(queue), MetadataKey(id)}, id, string(metadata), string(updatedMetadata), string(queuedTask), task.Priority).Int()
 		if err != nil {
 			return moved, fmt.Errorf("move due retry: %w", err)
 		}
@@ -126,13 +126,15 @@ return 1
 `
 
 const moveDueRetryScript = `
-if redis.call('GET', KEYS[3]) ~= ARGV[2] then
+if redis.call('GET', KEYS[4]) ~= ARGV[2] then
   return 0
 end
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then
   return 0
 end
-redis.call('SET', KEYS[3], ARGV[3])
-redis.call('RPUSH', KEYS[2], ARGV[4])
+local sequence = redis.call('INCR', KEYS[3])
+local member = string.format('%020d', sequence) .. '|' .. ARGV[4]
+redis.call('SET', KEYS[4], ARGV[3])
+redis.call('ZADD', KEYS[2], -tonumber(ARGV[5]), member)
 return 1
 `
