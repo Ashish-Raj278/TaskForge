@@ -3,54 +3,69 @@ package logger
 import (
 	"TaskForge/internal/task"
 	"encoding/json"
-	"fmt"
-	"log"
+	"io"
 	"os"
+	"sync"
+	"time"
 )
 
-func LogSuccess(cur_task task.Task) {
-	f, err := os.OpenFile("logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+var outputMu sync.Mutex
+var output io.Writer = os.Stdout
 
-	if err != nil {
-		log.Fatal("Error logging: ", err)
-		return
-	}
-	defer f.Close()
-
-	payload_str, er := json.Marshal(cur_task.Payload)
-	if er != nil {
-		payload_str = []byte{}
-	}
-
-	text := "\n SUCCESS: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Attempts: " + fmt.Sprintf("%d/%d", cur_task.Attempts, cur_task.MaxRetries)
-
-	if _, err := f.WriteString(text); err != nil {
-		log.Fatal("Error writing to the log file: ", err)
-		return
-	}
-	log.Println("logged successfully to the file")
+type event struct {
+	Timestamp string      `json:"timestamp"`
+	Level     string      `json:"level"`
+	Event     string      `json:"event"`
+	JobID     string      `json:"job_id,omitempty"`
+	JobType   string      `json:"job_type,omitempty"`
+	Status    task.Status `json:"status,omitempty"`
+	Priority  int         `json:"priority,omitempty"`
+	Attempts  int         `json:"attempts,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Count     int         `json:"count,omitempty"`
+	Duration  int64       `json:"duration_ms"`
 }
 
-func LogFailure(cur_task task.Task, cur_err error) {
+func Job(name string, queuedTask task.Task, err error) {
+	JobDuration(name, queuedTask, err, 0)
+}
 
-	f, err := os.OpenFile("logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-
+func JobDuration(name string, queuedTask task.Task, err error, duration time.Duration) {
+	e := event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, JobID: queuedTask.ID, JobType: queuedTask.Type, Status: queuedTask.Status, Priority: queuedTask.Priority, Attempts: queuedTask.Attempts, Duration: duration.Milliseconds()}
 	if err != nil {
-		log.Fatal("Error logging: ", err)
+		e.Level = "error"
+		e.Error = err.Error()
+	}
+	write(e)
+}
+
+func Count(name string, count int) {
+	write(event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, Count: count})
+}
+
+func Event(name string) {
+	write(event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name})
+}
+
+// SetOutput changes the event sink and returns a restore function. It is useful for tests.
+func SetOutput(w io.Writer) func() {
+	outputMu.Lock()
+	previous := output
+	output = w
+	outputMu.Unlock()
+	return func() {
+		outputMu.Lock()
+		output = previous
+		outputMu.Unlock()
+	}
+}
+
+func write(e event) {
+	encoded, err := json.Marshal(e)
+	if err != nil {
 		return
 	}
-	defer f.Close()
-
-	payload_str, er := json.Marshal(cur_task.Payload)
-	if er != nil {
-		payload_str = []byte{}
-	}
-
-	text := "FAILURE: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Attempts: " + fmt.Sprintf("%d/%d", cur_task.Attempts, cur_task.MaxRetries) + " Error message: " + cur_err.Error()
-
-	if _, err := f.WriteString(text); err != nil {
-		log.Fatal("Error writing to the log file: ", err)
-		return
-	}
-	log.Println("logged successfully to the file")
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	_, _ = output.Write(append(encoded, '\n'))
 }

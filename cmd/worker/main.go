@@ -1,10 +1,10 @@
 package main
 
 import (
+	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
 	"TaskForge/internal/worker"
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -39,7 +39,9 @@ func main() {
 	go func() { pool.Run(workerContext); close(workerDone) }()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", metricsHandler(pool))
+	mux.HandleFunc("/metrics", observability.MetricsHandler(rdb, pool.Metrics()))
+	mux.HandleFunc("/health", observability.HealthHandler(rdb))
+	mux.HandleFunc("/ready", observability.ReadyHandler(rdb))
 	server := &http.Server{Addr: ":" + os.Getenv("PORT_WORKER"), Handler: mux}
 	serverDone := make(chan struct{})
 	go func() {
@@ -63,19 +65,4 @@ func main() {
 		log.Printf("Redis close error: %v", err)
 	}
 	log.Println("worker shutdown complete")
-}
-
-func metricsHandler(pool *worker.Pool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Only GET request allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		stats := pool.Stats()
-		metrics := task.Metrics{Total_jobs_in_queue: stats.QueueLength, Jobs_done: int(stats.JobsDone), Jobs_failed: int(stats.JobsFailed)}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(metrics); err != nil {
-			log.Printf("Could not encode metrics: %v", err)
-		}
-	}
 }

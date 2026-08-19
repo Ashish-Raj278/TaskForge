@@ -2,6 +2,7 @@ package worker
 
 import (
 	"TaskForge/internal/logger"
+	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
 	"context"
 	"errors"
@@ -40,6 +41,7 @@ type Pool struct {
 	queueLength       atomic.Int64
 	jobsDone          atomic.Int64
 	jobsFailed        atomic.Int64
+	metrics           *observability.Metrics
 }
 
 // WorkerCount returns the configured worker count, defaulting to three for missing or invalid values.
@@ -90,8 +92,11 @@ func NewPool(rdb *redis.Client, queue string, workerCount int, visibilityTimeout
 		retryBaseDelay:    retryBaseDelay,
 		logger:            logger,
 		execute:           Process_Task,
+		metrics:           observability.NewMetrics(),
 	}
 }
+
+func (p *Pool) Metrics() *observability.Metrics { return p.metrics }
 
 // Run starts the configured workers and recovery loop, returning after they all stop.
 func (p *Pool) Run(ctx context.Context) {
@@ -115,8 +120,8 @@ func (p *Pool) runScheduleScheduler(ctx context.Context, wg *sync.WaitGroup) {
 	ticker := time.NewTicker(scheduleSchedulerInterval)
 	defer ticker.Stop()
 
-	p.logger.Println("scheduled-job scheduler started")
-	defer p.logger.Println("scheduled-job scheduler stopped")
+	logger.Event("scheduler_started")
+	defer logger.Event("scheduler_stopped")
 	for {
 		select {
 		case <-ctx.Done():
@@ -140,6 +145,10 @@ func (p *Pool) Stats() Stats {
 
 func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) {
 	defer wg.Done()
+	p.metrics.WorkerStarted()
+	defer p.metrics.WorkerStopped()
+	logger.Event("worker_started")
+	defer logger.Event("worker_stopped")
 	p.logger.Printf("worker %d started", workerID)
 	defer p.logger.Printf("worker %d stopped", workerID)
 	for {
@@ -169,6 +178,7 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 		}
 
 		p.updateQueueLength(workerID)
+		logger.Job("job_claimed", taskToExecute, nil)
 		p.processTask(workerID, rawTask, taskToExecute)
 	}
 }
@@ -181,10 +191,14 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 		p.logger.Printf("worker %d could not mark task %s as processing: %v", workerID, taskToExecute.ID, err)
 		return
 	}
+	logger.Job("job_started", taskToExecute, nil)
+	executionStarted := time.Now()
 
 	p.logger.Printf("worker %d processing task %s (%s)", workerID, taskToExecute.ID, taskToExecute.Type)
 	if err := p.execute(taskToExecute); err != nil {
 		p.jobsFailed.Add(1)
+		p.metrics.Failed()
+		logger.JobDuration("job_failed", taskToExecute, err, time.Since(executionStarted))
 		if task.CanRetry(taskToExecute) {
 			retryAt := time.Now().UTC().Add(task.RetryDelay(p.retryBaseDelay, taskToExecute.Attempts))
 			retryingTask, scheduleErr := task.ScheduleRetry(metadataContext, p.rdb, rawTask, taskToExecute.ID, retryAt, err)
@@ -192,7 +206,8 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 				p.logger.Printf("worker %d could not schedule retry for task %s: %v", workerID, taskToExecute.ID, scheduleErr)
 				return
 			}
-			logger.LogFailure(retryingTask, err)
+			p.metrics.Retried()
+			logger.Job("job_retry_scheduled", retryingTask, err)
 			p.logger.Printf("worker %d scheduled retry for task %s at %s", workerID, taskToExecute.ID, retryAt.Format(time.RFC3339Nano))
 			return
 		}
@@ -202,7 +217,8 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 			p.logger.Printf("worker %d could not move task %s to the dead-letter queue: %v", workerID, taskToExecute.ID, updateErr)
 			return
 		}
-		logger.LogFailure(failedTask, err)
+		p.metrics.Dead()
+		logger.JobDuration("job_dead", failedTask, err, time.Since(executionStarted))
 		p.logger.Printf("worker %d dead-lettered task %s", workerID, taskToExecute.ID)
 		return
 	}
@@ -213,7 +229,8 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 		p.logger.Printf("worker %d could not mark task %s as completed: %v", workerID, taskToExecute.ID, err)
 		return
 	}
-	logger.LogSuccess(completedTask)
+	p.metrics.Completed()
+	logger.JobDuration("job_completed", completedTask, nil, time.Since(executionStarted))
 	p.logger.Printf("worker %d completed task %s", workerID, taskToExecute.ID)
 }
 
@@ -222,8 +239,8 @@ func (p *Pool) runRetryScheduler(ctx context.Context, wg *sync.WaitGroup) {
 	ticker := time.NewTicker(retrySchedulerInterval)
 	defer ticker.Stop()
 
-	p.logger.Println("retry scheduler started")
-	defer p.logger.Println("retry scheduler stopped")
+	logger.Event("scheduler_started")
+	defer logger.Event("scheduler_stopped")
 	for {
 		select {
 		case <-ctx.Done():
@@ -250,8 +267,8 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	p.logger.Printf("processing recovery started with visibility timeout %s", p.visibilityTimeout)
-	defer p.logger.Println("processing recovery stopped")
+	logger.Event("scheduler_started")
+	defer logger.Event("scheduler_stopped")
 	for {
 		select {
 		case <-ctx.Done():
@@ -263,6 +280,8 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 				continue
 			}
 			if recovered > 0 {
+				p.metrics.Recovered(recovered)
+				logger.Count("job_recovered", recovered)
 				p.logger.Printf("recovered %d abandoned task(s)", recovered)
 			}
 		}

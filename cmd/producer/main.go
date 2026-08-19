@@ -1,6 +1,8 @@
 package main
 
 import (
+	"TaskForge/internal/logger"
+	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
 	"context"
 	"encoding/json"
@@ -18,6 +20,7 @@ import (
 )
 
 var rdb *redis.Client
+var metrics = observability.NewMetrics()
 
 var ctx = context.Background()
 
@@ -52,6 +55,9 @@ func main() {
 	http.HandleFunc("/jobs/", getJobHandler)
 	http.HandleFunc("/dlq", getDLQHandler)
 	http.HandleFunc("/dlq/", retryDLQHandler)
+	http.HandleFunc("/metrics", observability.MetricsHandler(rdb, metrics))
+	http.HandleFunc("/health", observability.HealthHandler(rdb))
+	http.HandleFunc("/ready", observability.ReadyHandler(rdb))
 
 	log.Println("Starting the server on port ", PORT)
 
@@ -135,15 +141,18 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
+		metrics.Enqueued()
+		logger.Job("job_enqueued", queuedTask, nil)
 		fmt.Fprintf(w, "Task of type '%s' has been successfully scheduled", queuedTask.Type)
 		return
 	}
-
 	queueLength, err := task.StoreAndEnqueue(ctx, rdb, task.PriorityQueue, queuedTask)
 	if err != nil {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	metrics.Enqueued()
+	logger.Job("job_enqueued", queuedTask, nil)
 	fmt.Println("Length of queue ", queueLength)
 
 	fmt.Fprintf(w, "Task of type '%s' has been successfully added to the queue", queuedTask.Type)
@@ -235,6 +244,8 @@ func retryDLQHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Job is not dead", http.StatusConflict)
 		return
 	}
+	metrics.Replayed()
+	logger.Job("job_replayed", replayedTask, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(replayedTask); err != nil {
