@@ -42,7 +42,10 @@ func ScheduleRetry(ctx context.Context, rdb *redis.Client, rawTask, id string, r
 
 	task.Status = StatusRetrying
 	task.ProcessingStartedAt = nil
-	utcRetryAt := retryAt.UTC()
+	// Redis sorted-set scores are stored at millisecond precision. Keep the
+	// metadata timestamp at the same precision so the scheduler and Redis use
+	// one consistent eligibility boundary.
+	utcRetryAt := retryAt.UTC().Truncate(time.Millisecond)
 	task.NextRetryAt = &utcRetryAt
 	if lastError != nil {
 		task.LastError = lastError.Error()
@@ -52,7 +55,7 @@ func ScheduleRetry(ctx context.Context, rdb *redis.Client, rawTask, id string, r
 		return Task{}, fmt.Errorf("marshal retry metadata: %w", err)
 	}
 
-	result, err := rdb.Eval(ctx, scheduleRetryScript, []string{ProcessingQueue, RetryQueue, MetadataKey(id)}, rawTask, string(metadata), string(updatedMetadata), retryAt.UnixMilli(), id).Int()
+	result, err := rdb.Eval(ctx, scheduleRetryScript, []string{ProcessingQueue, RetryQueue, MetadataKey(id)}, rawTask, string(metadata), string(updatedMetadata), utcRetryAt.UnixMilli(), id).Int()
 	if err != nil {
 		return Task{}, fmt.Errorf("schedule retry: %w", err)
 	}

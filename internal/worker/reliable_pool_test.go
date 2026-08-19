@@ -23,6 +23,9 @@ func integrationRedis(t *testing.T) *redis.Client {
 	if err != nil {
 		t.Fatalf("parse Redis URL: %v", err)
 	}
+	// Keep worker integration tests separate from other package test binaries,
+	// which otherwise share TaskForge's global queue key names.
+	options.DB = 14
 	client := redis.NewClient(options)
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		client.Close()

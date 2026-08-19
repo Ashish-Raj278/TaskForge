@@ -22,6 +22,9 @@ func testRedis(t *testing.T) *redis.Client {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Do not inspect a live queue or collide with Redis-backed integration tests
+	// from other packages when Go runs package tests concurrently.
+	options.DB = 13
 	client := redis.NewClient(options)
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		client.Close()

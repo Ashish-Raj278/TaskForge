@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -13,21 +12,7 @@ import (
 
 func retryRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		url = "redis://localhost:6379"
-	}
-	options, err := redis.ParseURL(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rdb := redis.NewClient(options)
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		rdb.Close()
-		t.Skipf("Redis unavailable: %v", err)
-	}
-	t.Cleanup(func() { rdb.Close() })
-	return rdb
+	return redisClient(t)
 }
 
 func TestRetryDelay(t *testing.T) {

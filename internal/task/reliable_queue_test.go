@@ -20,6 +20,10 @@ func redisClient(t *testing.T) *redis.Client {
 	if err != nil {
 		t.Fatalf("parse Redis URL: %v", err)
 	}
+	// Integration tests use their own Redis database so package test binaries
+	// cannot consume each other's global queue keys when go test runs them in
+	// parallel.
+	options.DB = 15
 	client := redis.NewClient(options)
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		client.Close()
