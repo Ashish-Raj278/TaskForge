@@ -7,11 +7,36 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+type zCardCounter struct{ count atomic.Int64 }
+
+func (counter *zCardCounter) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (counter *zCardCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		if command.Name() == "zcard" {
+			counter.count.Add(1)
+		}
+		return next(ctx, command)
+	}
+}
+
+func (counter *zCardCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, commands []redis.Cmder) error {
+		for _, command := range commands {
+			if command.Name() == "zcard" {
+				counter.count.Add(1)
+			}
+		}
+		return next(ctx, commands)
+	}
+}
 
 func integrationRedis(t *testing.T) *redis.Client {
 	t.Helper()
@@ -148,6 +173,55 @@ func TestPoolConsumesTasksConcurrently(t *testing.T) {
 	}
 	if stats := pool.Stats(); stats.JobsDone != int64(len(queuedTasks)) {
 		t.Fatalf("jobs done = %d, want %d", stats.JobsDone, len(queuedTasks))
+	}
+}
+
+func TestPoolDoesNotReadQueueDepthForEachClaim(t *testing.T) {
+	ctx := context.Background()
+	rdb := integrationRedis(t)
+	queue := fmt.Sprintf("task_test_queue:%d", time.Now().UnixNano())
+	queuedTask := integrationTask(t, "generate_pdf")
+	if _, err := task.StoreAndEnqueue(ctx, rdb, queue, queuedTask); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		rdb.Del(ctx, queue, task.PrioritySequenceKey(queue), task.MetadataKey(queuedTask.ID))
+	})
+	counter := &zCardCounter{}
+	rdb.AddHook(counter)
+
+	poolContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := NewPool(rdb, queue, 1, time.Hour, DefaultRetryBaseDelay, log.New(io.Discard, "", 0))
+	pool.execute = func(task.Task) error { return nil }
+	done := make(chan struct{})
+	go func() {
+		pool.Run(poolContext)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		metadata, err := task.GetMetadata(ctx, rdb, queuedTask.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metadata.Status == task.StatusCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pool did not stop")
+	}
+	if got := counter.count.Load(); got != 0 {
+		t.Fatalf("worker issued %d ZCARD command(s), want 0", got)
 	}
 }
 

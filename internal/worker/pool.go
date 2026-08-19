@@ -4,6 +4,7 @@ import (
 	"TaskForge/internal/logger"
 	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
+	"TaskForge/internal/tracing"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -27,9 +31,8 @@ const (
 )
 
 type Stats struct {
-	QueueLength int64
-	JobsDone    int64
-	JobsFailed  int64
+	JobsDone   int64
+	JobsFailed int64
 }
 
 type Pool struct {
@@ -40,7 +43,6 @@ type Pool struct {
 	retryBaseDelay    time.Duration
 	logger            *log.Logger
 	execute           func(task.Task) error
-	queueLength       atomic.Int64
 	jobsDone          atomic.Int64
 	jobsFailed        atomic.Int64
 	metrics           *observability.Metrics
@@ -129,7 +131,15 @@ func (p *Pool) runScheduleScheduler(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			moved, err := task.MoveDueScheduled(ctx, p.rdb, p.queue, time.Now().UTC())
+			moved, err := task.MoveDueScheduledWithCallback(ctx, p.rdb, p.queue, time.Now().UTC(), func(queuedTask task.Task) {
+				spanContext := tracing.ContextWithTraceParent(ctx, queuedTask.TraceParent)
+				spanContext, span := tracing.Start(spanContext, "task.schedule.promote", oteltrace.WithAttributes(tracing.JobAttributes(queuedTask.ID, queuedTask.Type, queuedTask.Priority, queuedTask.Attempts, string(queuedTask.Status))...))
+				if queuedTask.ScheduledAt != nil {
+					span.SetAttributes(attribute.String("job.scheduled_at", queuedTask.ScheduledAt.UTC().Format(time.RFC3339Nano)))
+				}
+				logger.JobContext(spanContext, "job_scheduled_promoted", queuedTask, nil)
+				span.End()
+			})
 			if err != nil {
 				p.logger.Printf("scheduled-job scheduler error: %v", err)
 				if !waitForContext(ctx, redisFailureBackoff) {
@@ -145,7 +155,7 @@ func (p *Pool) runScheduleScheduler(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (p *Pool) Stats() Stats {
-	return Stats{QueueLength: p.queueLength.Load(), JobsDone: p.jobsDone.Load(), JobsFailed: p.jobsFailed.Load()}
+	return Stats{JobsDone: p.jobsDone.Load(), JobsFailed: p.jobsFailed.Load()}
 }
 
 func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) {
@@ -185,13 +195,20 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 			continue
 		}
 
-		p.updateQueueLength(workerID)
-		logger.JobForWorker("job_claimed", workerID, taskToExecute, nil, 0)
-		p.processTask(workerID, rawTask, taskToExecute)
+		claimContext := tracing.ContextWithTraceParent(ctx, taskToExecute.TraceParent)
+		claimContext, claimSpan := tracing.Start(claimContext, "task.claim", oteltrace.WithSpanKind(oteltrace.SpanKindConsumer), oteltrace.WithAttributes(tracing.JobAttributes(taskToExecute.ID, taskToExecute.Type, taskToExecute.Priority, taskToExecute.Attempts, string(taskToExecute.Status))...))
+		claimSpan.SetAttributes(attribute.Int("worker.id", workerID))
+		logger.JobForWorkerContext(claimContext, "job_claimed", workerID, taskToExecute, nil, 0)
+		claimSpan.End()
+		p.processTaskContext(claimContext, workerID, rawTask, taskToExecute)
 	}
 }
 
 func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task) {
+	p.processTaskContext(context.Background(), workerID, rawTask, taskToExecute)
+}
+
+func (p *Pool) processTaskContext(ctx context.Context, workerID int, rawTask string, taskToExecute task.Task) {
 	metadataContext := context.Background()
 	var err error
 	taskToExecute, err = task.StartProcessing(metadataContext, p.rdb, taskToExecute.ID)
@@ -199,46 +216,70 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 		p.logger.Printf("worker %d could not mark task %s as processing: %v", workerID, taskToExecute.ID, err)
 		return
 	}
-	logger.JobForWorker("job_started", workerID, taskToExecute, nil, 0)
+	executionContext, executionSpan := tracing.Start(ctx, "task.execute", oteltrace.WithAttributes(tracing.JobAttributes(taskToExecute.ID, taskToExecute.Type, taskToExecute.Priority, taskToExecute.Attempts, string(taskToExecute.Status))...))
+	defer executionSpan.End()
+	executionSpan.SetAttributes(attribute.Int("worker.id", workerID))
+	logger.JobForWorkerContext(executionContext, "job_started", workerID, taskToExecute, nil, 0)
 	executionStarted := time.Now()
 
 	p.logger.Printf("worker %d processing task %s (%s)", workerID, taskToExecute.ID, taskToExecute.Type)
 	if err := executeSafely(p.execute, taskToExecute); err != nil {
 		p.jobsFailed.Add(1)
 		p.metrics.Failed()
-		logger.JobForWorker("job_failed", workerID, taskToExecute, err, time.Since(executionStarted))
+		tracing.SetError(executionSpan, err)
+		logger.JobForWorkerContext(executionContext, "job_failed", workerID, taskToExecute, err, time.Since(executionStarted))
 		if task.CanRetry(taskToExecute) {
 			retryAt := time.Now().UTC().Add(task.RetryDelay(p.retryBaseDelay, taskToExecute.Attempts))
+			retryContext, retrySpan := tracing.Start(executionContext, "task.retry.schedule", oteltrace.WithAttributes(tracing.JobAttributes(taskToExecute.ID, taskToExecute.Type, taskToExecute.Priority, taskToExecute.Attempts, string(task.StatusRetrying))...))
+			retrySpan.SetAttributes(attribute.String("job.retry_at", retryAt.Format(time.RFC3339Nano)))
 			retryingTask, scheduleErr := task.ScheduleRetry(metadataContext, p.rdb, rawTask, taskToExecute.ID, retryAt, err)
 			if scheduleErr != nil {
+				tracing.SetError(retrySpan, scheduleErr)
+				retrySpan.End()
 				p.logger.Printf("worker %d could not schedule retry for task %s: %v", workerID, taskToExecute.ID, scheduleErr)
 				return
 			}
+			retrySpan.SetStatus(codes.Ok, "retry scheduled")
+			retrySpan.End()
+			executionSpan.SetAttributes(attribute.String("job.final_status", string(task.StatusRetrying)))
 			p.metrics.Retried()
-			logger.JobForWorker("job_retry_scheduled", workerID, retryingTask, err, time.Since(executionStarted))
+			logger.JobForWorkerContext(retryContext, "job_retry_scheduled", workerID, retryingTask, err, time.Since(executionStarted))
 			p.logger.Printf("worker %d scheduled retry for task %s at %s", workerID, taskToExecute.ID, retryAt.Format(time.RFC3339Nano))
 			return
 		}
 
+		dlqContext, dlqSpan := tracing.Start(executionContext, "task.dlq.transition", oteltrace.WithAttributes(tracing.JobAttributes(taskToExecute.ID, taskToExecute.Type, taskToExecute.Priority, taskToExecute.Attempts, string(task.StatusDead))...))
 		failedTask, updateErr := task.MoveToDLQ(metadataContext, p.rdb, rawTask, taskToExecute.ID, err)
 		if updateErr != nil {
+			tracing.SetError(dlqSpan, updateErr)
+			dlqSpan.End()
 			p.logger.Printf("worker %d could not move task %s to the dead-letter queue: %v", workerID, taskToExecute.ID, updateErr)
 			return
 		}
+		dlqSpan.SetStatus(codes.Ok, "dead-lettered")
+		dlqSpan.End()
+		executionSpan.SetAttributes(attribute.String("job.final_status", string(task.StatusDead)))
 		p.metrics.Dead()
-		logger.JobForWorker("job_dead", workerID, failedTask, err, time.Since(executionStarted))
+		logger.JobForWorkerContext(dlqContext, "job_dead", workerID, failedTask, err, time.Since(executionStarted))
 		p.logger.Printf("worker %d dead-lettered task %s", workerID, taskToExecute.ID)
 		return
 	}
 
 	p.jobsDone.Add(1)
+	ackContext, ackSpan := tracing.Start(executionContext, "task.acknowledge", oteltrace.WithAttributes(tracing.JobAttributes(taskToExecute.ID, taskToExecute.Type, taskToExecute.Priority, taskToExecute.Attempts, string(task.StatusCompleted))...))
 	completedTask, err := task.MarkCompletedAndAcknowledge(metadataContext, p.rdb, rawTask, taskToExecute.ID)
 	if err != nil {
+		tracing.SetError(ackSpan, err)
+		ackSpan.End()
 		p.logger.Printf("worker %d could not mark task %s as completed: %v", workerID, taskToExecute.ID, err)
 		return
 	}
+	ackSpan.SetStatus(codes.Ok, "acknowledged")
+	ackSpan.End()
+	executionSpan.SetAttributes(attribute.String("job.final_status", string(task.StatusCompleted)), attribute.Int64("job.execution_duration_ms", time.Since(executionStarted).Milliseconds()))
+	executionSpan.SetStatus(codes.Ok, "completed")
 	p.metrics.Completed()
-	logger.JobForWorker("job_completed", workerID, completedTask, nil, time.Since(executionStarted))
+	logger.JobForWorkerContext(ackContext, "job_completed", workerID, completedTask, nil, time.Since(executionStarted))
 	p.logger.Printf("worker %d completed task %s", workerID, taskToExecute.ID)
 }
 
@@ -254,7 +295,12 @@ func (p *Pool) runRetryScheduler(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			moved, err := task.MoveDueRetries(ctx, p.rdb, p.queue, time.Now().UTC())
+			moved, err := task.MoveDueRetriesWithCallback(ctx, p.rdb, p.queue, time.Now().UTC(), func(queuedTask task.Task) {
+				spanContext := tracing.ContextWithTraceParent(ctx, queuedTask.TraceParent)
+				spanContext, span := tracing.Start(spanContext, "task.retry.promote", oteltrace.WithAttributes(tracing.JobAttributes(queuedTask.ID, queuedTask.Type, queuedTask.Priority, queuedTask.Attempts, string(queuedTask.Status))...))
+				logger.JobContext(spanContext, "job_retry_promoted", queuedTask, nil)
+				span.End()
+			})
 			if err != nil {
 				p.logger.Printf("retry scheduler error: %v", err)
 				if !waitForContext(ctx, redisFailureBackoff) {
@@ -285,7 +331,13 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			recovered, err := task.RecoverAbandoned(ctx, p.rdb, p.queue, p.visibilityTimeout)
+			recovered, err := task.RecoverAbandonedWithCallback(ctx, p.rdb, p.queue, p.visibilityTimeout, func(queuedTask task.Task) {
+				spanContext := tracing.ContextWithTraceParent(ctx, queuedTask.TraceParent)
+				spanContext, span := tracing.Start(spanContext, "task.recover", oteltrace.WithAttributes(tracing.JobAttributes(queuedTask.ID, queuedTask.Type, queuedTask.Priority, queuedTask.Attempts, string(queuedTask.Status))...))
+				span.SetAttributes(attribute.String("recovery.reason", "visibility_timeout"), attribute.String("job.final_status", string(task.StatusPending)))
+				logger.JobContext(spanContext, "job_recovered", queuedTask, nil)
+				span.End()
+			})
 			if err != nil {
 				p.logger.Printf("processing recovery error: %v", err)
 				if !waitForContext(ctx, redisFailureBackoff) {
@@ -320,13 +372,4 @@ func waitForContext(ctx context.Context, duration time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
-}
-
-func (p *Pool) updateQueueLength(workerID int) {
-	queueLength, err := p.rdb.ZCard(context.Background(), p.queue).Result()
-	if err != nil {
-		p.logger.Printf("worker %d could not read queue length: %v", workerID, err)
-		return
-	}
-	p.queueLength.Store(queueLength)
 }

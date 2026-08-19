@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"TaskForge/internal/task"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +37,28 @@ func testRedis(t *testing.T) *redis.Client {
 
 func TestMetricsHealthAndReadyHandlers(t *testing.T) {
 	rdb := testRedis(t)
+	ctx := context.Background()
+	if err := rdb.Del(ctx, task.PriorityQueue, task.ProcessingQueue, task.RetryQueue, task.ScheduleQueue, task.DeadLetterQueue).Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		rdb.Del(ctx, task.PriorityQueue, task.ProcessingQueue, task.RetryQueue, task.ScheduleQueue, task.DeadLetterQueue)
+	})
+	if err := rdb.ZAdd(ctx, task.PriorityQueue, redis.Z{Score: 1, Member: "pending"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.RPush(ctx, task.ProcessingQueue, "processing").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.ZAdd(ctx, task.RetryQueue, redis.Z{Score: 1, Member: "retry"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.ZAdd(ctx, task.ScheduleQueue, redis.Z{Score: 1, Member: "scheduled"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.RPush(ctx, task.DeadLetterQueue, "dead").Err(); err != nil {
+		t.Fatal(err)
+	}
 	metrics := NewMetrics()
 	metrics.Enqueued()
 	metrics.Completed()
@@ -46,7 +69,7 @@ func TestMetricsHealthAndReadyHandlers(t *testing.T) {
 		t.Fatalf("metrics status = %d", response.Code)
 	}
 	body := response.Body.String()
-	for _, name := range []string{"taskforge_jobs_enqueued_total 1", "taskforge_jobs_completed_total 1", "taskforge_jobs_retried_total 1", "taskforge_queue_depth", "taskforge_processing_depth", "taskforge_retry_queue_depth", "taskforge_scheduled_queue_depth", "taskforge_dlq_depth", "taskforge_active_workers"} {
+	for _, name := range []string{"taskforge_jobs_enqueued_total 1", "taskforge_jobs_completed_total 1", "taskforge_jobs_retried_total 1", "taskforge_queue_depth 1", "taskforge_processing_depth 1", "taskforge_retry_queue_depth 1", "taskforge_scheduled_queue_depth 1", "taskforge_dlq_depth 1", "taskforge_active_workers"} {
 		if !strings.Contains(body, name) {
 			t.Fatalf("metrics missing %q: %s", name, body)
 		}

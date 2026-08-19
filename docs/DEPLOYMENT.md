@@ -54,6 +54,10 @@ docker compose down
 | `WORKER_COUNT` | worker | `3` | Concurrent worker goroutines; invalid or non-positive values use the default. |
 | `TASK_VISIBILITY_TIMEOUT` | worker | `30s` | Lease timeout before abandoned processing jobs are recovered. |
 | `TASK_RETRY_BASE_DELAY` | worker | `2s` | First retry delay; subsequent delays use exponential backoff. |
+| `OTEL_TRACING_ENABLED` | producer, worker | `false` | Enables OpenTelemetry only when an OTLP endpoint is also configured. |
+| `OTEL_SERVICE_NAME` | producer, worker | process-specific | Name reported to the tracing backend. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | producer, worker | empty | OTLP/gRPC endpoint, for example `jaeger:4317`. |
+| `OTEL_EXPORTER_OTLP_INSECURE` | producer, worker | `true` | Uses insecure OTLP/gRPC transport for local collectors. |
 
 All values can be supplied through the runtime environment. Do not place Redis
 credentials or other secrets in committed Compose overrides; use a secret store
@@ -93,3 +97,20 @@ worker images as separate services, provide a managed Redis endpoint through
 
 Cloud credentials, a domain, TLS certificates, and a managed Redis service are
 environment-specific and are intentionally not included in this repository.
+
+## Optional local tracing
+
+Tracing is disabled by default and has no exporter unless both
+`OTEL_TRACING_ENABLED=true` and `OTEL_EXPORTER_OTLP_ENDPOINT` are set. The
+Compose `tracing` profile provides Jaeger with OTLP enabled:
+
+```powershell
+$env:OTEL_TRACING_ENABLED = "true"
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = "jaeger:4317"
+docker compose --profile tracing up --build
+```
+
+Open `http://localhost:16686`, select either `taskforge-producer` or
+`taskforge-worker`, and inspect job spans. Stop the optional profile with the
+normal `docker compose down` command. Do not expose an unauthenticated Jaeger
+UI or insecure OTLP collector directly to the public internet.

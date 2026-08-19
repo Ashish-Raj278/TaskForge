@@ -67,6 +67,13 @@ func ScheduleRetry(ctx context.Context, rdb *redis.Client, rawTask, id string, r
 
 // MoveDueRetries atomically returns eligible retrying jobs to the execution queue.
 func MoveDueRetries(ctx context.Context, rdb *redis.Client, queue string, now time.Time) (int, error) {
+	return MoveDueRetriesWithCallback(ctx, rdb, queue, now, nil)
+}
+
+// MoveDueRetriesWithCallback invokes moved after each retry safely returns to
+// the pending priority queue. The callback does not participate in Redis state
+// transitions and is intended for observability.
+func MoveDueRetriesWithCallback(ctx context.Context, rdb *redis.Client, queue string, now time.Time, onMoved func(Task)) (int, error) {
 	ids, err := rdb.ZRangeByScore(ctx, RetryQueue, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprintf("%d", now.UnixMilli())}).Result()
 	if err != nil {
 		return 0, fmt.Errorf("list due retries: %w", err)
@@ -112,6 +119,9 @@ func MoveDueRetries(ctx context.Context, rdb *redis.Client, queue string, now ti
 			return moved, fmt.Errorf("move due retry: %w", err)
 		}
 		moved += result
+		if result == 1 && onMoved != nil {
+			onMoved(task)
+		}
 	}
 	return moved, nil
 }

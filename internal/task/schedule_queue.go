@@ -31,6 +31,12 @@ func StoreAndSchedule(ctx context.Context, rdb *redis.Client, task Task) error {
 
 // MoveDueScheduled atomically makes all due pending jobs available to the priority queue.
 func MoveDueScheduled(ctx context.Context, rdb *redis.Client, queue string, now time.Time) (int, error) {
+	return MoveDueScheduledWithCallback(ctx, rdb, queue, now, nil)
+}
+
+// MoveDueScheduledWithCallback invokes moved after each due job is atomically
+// inserted into the priority queue. The callback is observational only.
+func MoveDueScheduledWithCallback(ctx context.Context, rdb *redis.Client, queue string, now time.Time, onMoved func(Task)) (int, error) {
 	ids, err := rdb.ZRangeByScore(ctx, ScheduleQueue, &redis.ZRangeBy{Min: "-inf", Max: fmt.Sprintf("%d", now.UTC().UnixMilli()), Count: scheduledMoveBatchSize}).Result()
 	if err != nil {
 		return 0, fmt.Errorf("list due scheduled tasks: %w", err)
@@ -70,6 +76,9 @@ func MoveDueScheduled(ctx context.Context, rdb *redis.Client, queue string, now 
 			return moved, fmt.Errorf("move due scheduled task: %w", err)
 		}
 		moved += result
+		if result == 1 && onMoved != nil {
+			onMoved(queuedTask)
+		}
 	}
 	return moved, nil
 }

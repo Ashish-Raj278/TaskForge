@@ -48,6 +48,13 @@ func Acknowledge(ctx context.Context, rdb *redis.Client, rawTask string) error {
 
 // RecoverAbandoned moves expired processing tasks back to the queue without changing Attempts.
 func RecoverAbandoned(ctx context.Context, rdb *redis.Client, queue string, visibilityTimeout time.Duration) (int, error) {
+	return RecoverAbandonedWithCallback(ctx, rdb, queue, visibilityTimeout, nil)
+}
+
+// RecoverAbandonedWithCallback invokes recovered after an abandoned processing
+// entry has been atomically restored to the priority queue. The callback is
+// observational only and cannot affect queue recovery.
+func RecoverAbandonedWithCallback(ctx context.Context, rdb *redis.Client, queue string, visibilityTimeout time.Duration, onRecovered func(Task)) (int, error) {
 	rawTasks, err := rdb.LRange(ctx, ProcessingQueue, 0, -1).Result()
 	if err != nil {
 		return 0, fmt.Errorf("list processing tasks: %w", err)
@@ -89,6 +96,9 @@ func RecoverAbandoned(ctx context.Context, rdb *redis.Client, queue string, visi
 			return recovered, fmt.Errorf("recover processing task: %w", err)
 		}
 		recovered += result
+		if result == 1 && onRecovered != nil {
+			onRecovered(task)
+		}
 	}
 
 	return recovered, nil

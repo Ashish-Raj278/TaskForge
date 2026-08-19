@@ -34,6 +34,7 @@ type Task struct {
 	ProcessingStartedAt *time.Time             `json:"processing_started_at,omitempty"`
 	NextRetryAt         *time.Time             `json:"next_retry_at,omitempty"`
 	LastError           string                 `json:"last_error,omitempty"`
+	TraceParent         string                 `json:"traceparent,omitempty"`
 }
 
 // NewID creates a randomly generated UUID version 4 without an external dependency.

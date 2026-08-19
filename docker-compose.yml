@@ -19,6 +19,10 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       PORT_PRODUCER: "8080"
+      OTEL_TRACING_ENABLED: "${OTEL_TRACING_ENABLED:-false}"
+      OTEL_SERVICE_NAME: taskforge-producer
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+      OTEL_EXPORTER_OTLP_INSECURE: "${OTEL_EXPORTER_OTLP_INSECURE:-true}"
     ports:
       - "8080:8080"
     depends_on:
@@ -42,6 +46,10 @@ services:
       WORKER_COUNT: "${WORKER_COUNT:-4}"
       TASK_VISIBILITY_TIMEOUT: "${TASK_VISIBILITY_TIMEOUT:-30s}"
       TASK_RETRY_BASE_DELAY: "${TASK_RETRY_BASE_DELAY:-2s}"
+      OTEL_TRACING_ENABLED: "${OTEL_TRACING_ENABLED:-false}"
+      OTEL_SERVICE_NAME: taskforge-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+      OTEL_EXPORTER_OTLP_INSECURE: "${OTEL_EXPORTER_OTLP_INSECURE:-true}"
     ports:
       - "8081:8081"
     depends_on:
@@ -54,6 +62,15 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    profiles: ["tracing"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
 
 volumes:
   redis-data:

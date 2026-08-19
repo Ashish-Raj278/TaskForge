@@ -3,6 +3,7 @@ package main
 import (
 	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
+	"TaskForge/internal/tracing"
 	"TaskForge/internal/worker"
 	"context"
 	"errors"
@@ -28,6 +29,15 @@ func connectRedis() *redis.Client {
 
 func main() {
 	godotenv.Load()
+	shutdownTracing, tracingErr := tracing.Init(context.Background(), tracing.ConfigFromEnv("taskforge-worker"))
+	if tracingErr != nil {
+		log.Printf("worker tracing disabled: %v", tracingErr)
+	}
+	defer func() {
+		if err := shutdownTracing(context.Background()); err != nil {
+			log.Printf("worker tracing shutdown error: %v", err)
+		}
+	}()
 	rdb := connectRedis()
 	workerCount := worker.WorkerCount(os.Getenv("WORKER_COUNT"))
 	visibilityTimeout := worker.VisibilityTimeout(os.Getenv("TASK_VISIBILITY_TIMEOUT"))

@@ -2,6 +2,8 @@ package logger
 
 import (
 	"TaskForge/internal/task"
+	"TaskForge/internal/tracing"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -25,28 +27,44 @@ type event struct {
 	Error     string      `json:"error,omitempty"`
 	Count     int         `json:"count,omitempty"`
 	Duration  int64       `json:"duration_ms"`
+	TraceID   string      `json:"trace_id,omitempty"`
+	SpanID    string      `json:"span_id,omitempty"`
 }
 
 func Job(name string, queuedTask task.Task, err error) {
-	JobDuration(name, queuedTask, err, 0)
+	JobContext(context.Background(), name, queuedTask, err)
 }
 
 func JobForWorker(name string, workerID int, queuedTask task.Task, err error, duration time.Duration) {
-	e := event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, JobID: queuedTask.ID, JobType: queuedTask.Type, WorkerID: workerID, Status: queuedTask.Status, Priority: queuedTask.Priority, Attempts: queuedTask.Attempts, Duration: duration.Milliseconds()}
-	if err != nil {
-		e.Level = "error"
-		e.Error = err.Error()
-	}
+	JobForWorkerContext(context.Background(), name, workerID, queuedTask, err, duration)
+}
+
+func JobContext(ctx context.Context, name string, queuedTask task.Task, err error) {
+	JobDurationContext(ctx, name, queuedTask, err, 0)
+}
+
+func JobForWorkerContext(ctx context.Context, name string, workerID int, queuedTask task.Task, err error, duration time.Duration) {
+	e := newJobEvent(ctx, name, queuedTask, err, duration)
+	e.WorkerID = workerID
 	write(e)
 }
 
-func JobDuration(name string, queuedTask task.Task, err error, duration time.Duration) {
-	e := event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, JobID: queuedTask.ID, JobType: queuedTask.Type, Status: queuedTask.Status, Priority: queuedTask.Priority, Attempts: queuedTask.Attempts, Duration: duration.Milliseconds()}
+func JobDurationContext(ctx context.Context, name string, queuedTask task.Task, err error, duration time.Duration) {
+	write(newJobEvent(ctx, name, queuedTask, err, duration))
+}
+
+func newJobEvent(ctx context.Context, name string, queuedTask task.Task, err error, duration time.Duration) event {
+	traceID, spanID := tracing.SpanIDs(ctx)
+	e := event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, JobID: queuedTask.ID, JobType: queuedTask.Type, Status: queuedTask.Status, Priority: queuedTask.Priority, Attempts: queuedTask.Attempts, Duration: duration.Milliseconds(), TraceID: traceID, SpanID: spanID}
 	if err != nil {
 		e.Level = "error"
 		e.Error = err.Error()
 	}
-	write(e)
+	return e
+}
+
+func JobDuration(name string, queuedTask task.Task, err error, duration time.Duration) {
+	JobDurationContext(context.Background(), name, queuedTask, err, duration)
 }
 
 func Count(name string, count int) {

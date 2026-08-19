@@ -4,6 +4,7 @@ import (
 	"TaskForge/internal/logger"
 	"TaskForge/internal/observability"
 	"TaskForge/internal/task"
+	"TaskForge/internal/tracing"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 var rdb *redis.Client
@@ -52,6 +55,15 @@ func connectRedis() *redis.Client {
 
 func main() {
 	godotenv.Load()
+	shutdownTracing, tracingErr := tracing.Init(context.Background(), tracing.ConfigFromEnv("taskforge-producer"))
+	if tracingErr != nil {
+		log.Printf("producer tracing disabled: %v", tracingErr)
+	}
+	defer func() {
+		if err := shutdownTracing(context.Background()); err != nil {
+			log.Printf("producer tracing shutdown error: %v", err)
+		}
+	}()
 	rdb = connectRedis()
 	defer func() {
 		if err := rdb.Close(); err != nil {
@@ -109,6 +121,9 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
+	spanContext := tracing.ExtractHTTP(r.Context(), r.Header)
+	spanContext, span := tracing.Start(spanContext, "task.enqueue", oteltrace.WithSpanKind(oteltrace.SpanKindProducer))
+	defer span.End()
 	r.Body = http.MaxBytesReader(w, r.Body, maxEnqueueBodyBytes)
 	defer r.Body.Close()
 
@@ -118,6 +133,7 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 	err := decoder.Decode(&request)
 
 	if err != nil {
+		tracing.SetError(span, err)
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
 			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
@@ -127,17 +143,20 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		tracing.SetError(span, err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
 	if request.Type == "" {
+		tracing.SetError(span, errors.New("task type is required"))
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
 	if request.Type == "send_email" {
 		if request.Payload["to"] == nil || request.Payload["subject"] == nil {
+			tracing.SetError(span, errors.New("send_email payload is incomplete"))
 			http.Error(w, "Bad request,pass to and subject fields inside the payload", http.StatusBadRequest)
 			return
 		}
@@ -151,6 +170,7 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 	maxRetries := task.DefaultMaxRetries
 	if request.MaxRetries != nil {
 		if *request.MaxRetries < 0 {
+			tracing.SetError(span, errors.New("max_retries must not be negative"))
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
@@ -159,6 +179,7 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 
 	id, err := task.NewID()
 	if err != nil {
+		tracing.SetError(span, err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -180,24 +201,30 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   time.Now().UTC(),
 		ScheduledAt: scheduledAt,
 	}
+	queuedTask.TraceParent = tracing.TraceParent(spanContext)
+	span.SetAttributes(tracing.JobAttributes(queuedTask.ID, queuedTask.Type, queuedTask.Priority, queuedTask.Attempts, string(queuedTask.Status))...)
 
 	if queuedTask.ScheduledAt != nil && queuedTask.ScheduledAt.After(time.Now().UTC()) {
 		if err := task.StoreAndSchedule(ctx, rdb, queuedTask); err != nil {
+			tracing.SetError(span, err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		metrics.Enqueued()
-		logger.Job("job_enqueued", queuedTask, nil)
+		span.SetStatus(codes.Ok, "scheduled")
+		logger.JobContext(spanContext, "job_enqueued", queuedTask, nil)
 		fmt.Fprintf(w, "Task of type '%s' has been successfully scheduled", queuedTask.Type)
 		return
 	}
 	queueLength, err := task.StoreAndEnqueue(ctx, rdb, task.PriorityQueue, queuedTask)
 	if err != nil {
+		tracing.SetError(span, err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	metrics.Enqueued()
-	logger.Job("job_enqueued", queuedTask, nil)
+	span.SetStatus(codes.Ok, "enqueued")
+	logger.JobContext(spanContext, "job_enqueued", queuedTask, nil)
 	fmt.Println("Length of queue ", queueLength)
 
 	fmt.Fprintf(w, "Task of type '%s' has been successfully added to the queue", queuedTask.Type)
@@ -278,19 +305,29 @@ func retryDLQHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	spanContext := tracing.ExtractHTTP(r.Context(), r.Header)
+	if queuedTask, err := task.GetMetadata(ctx, rdb, id); err == nil {
+		spanContext = tracing.ContextWithTraceParent(spanContext, queuedTask.TraceParent)
+	}
+	spanContext, span := tracing.Start(spanContext, "task.dlq.replay", oteltrace.WithSpanKind(oteltrace.SpanKindProducer))
+	defer span.End()
+	span.SetAttributes(tracing.JobAttributes(id, "", 0, 0, string(task.StatusPending))...)
 	replayedTask, err := task.ReplayDeadTask(ctx, rdb, task.PriorityQueue, id)
 	if errors.Is(err, task.ErrNotFound) {
+		tracing.SetError(span, err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": "job not found"})
 		return
 	}
 	if err != nil {
+		tracing.SetError(span, err)
 		http.Error(w, "Job is not dead", http.StatusConflict)
 		return
 	}
 	metrics.Replayed()
-	logger.Job("job_replayed", replayedTask, nil)
+	span.SetStatus(codes.Ok, "replayed")
+	logger.JobContext(spanContext, "job_replayed", replayedTask, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(replayedTask); err != nil {

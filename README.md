@@ -156,6 +156,70 @@ Lifecycle logs are structured JSON events such as `job_enqueued`, `job_claimed`,
 
 Production-hardening measures include bounded HTTP request bodies, malformed-JSON validation, HTTP read/write/idle timeouts, environment defaults and validation, Redis error backoff, panic recovery at the task-handler boundary, and idempotent cancellation paths.
 
+## Distributed tracing
+
+TaskForge uses optional OpenTelemetry tracing to answer a different question
+from logs and metrics:
+
+- **Metrics:** “What is happening?”
+- **Logs:** “What happened?”
+- **Traces:** “Where did this particular job spend its time and what happened across its lifecycle?”
+
+Tracing is disabled by default and the system remains fully functional without
+an OTLP backend. It activates only when both are set:
+
+```text
+OTEL_TRACING_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=<host:port>
+```
+
+`OTEL_SERVICE_NAME` defaults to `taskforge-producer` or `taskforge-worker`.
+`OTEL_EXPORTER_OTLP_INSECURE` defaults to `true` for local OTLP/gRPC collectors.
+When disabled, TaskForge installs a no-op provider and creates no exporter.
+
+The producer extracts a client W3C `traceparent` header and starts
+`task.enqueue`. It persists only the resulting W3C `traceparent` in
+server-owned job metadata; payloads, credentials, and request bodies are never
+placed in span attributes or structured logs. The worker restores that parent
+for `task.claim` and `task.execute`, with child spans for `task.acknowledge`,
+`task.retry.schedule`, `task.retry.promote`, `task.schedule.promote`,
+`task.recover`, and `task.dlq.transition`. Trace/span IDs are included in JSON
+lifecycle logs when a valid span is active.
+
+Example trace relationships:
+
+```text
+task.enqueue
+├── task.claim
+│   └── task.execute
+│       └── task.acknowledge
+├── task.retry.schedule
+├── task.retry.promote
+└── task.execute
+    └── task.dlq.transition
+```
+
+The asynchronous schedulers create spans from the stored W3C parent when they
+promote, recover, or requeue a job. This preserves one trace across retries,
+scheduling, and explicit DLQ replay without adding a queue-wide tracing
+service. It does not change queue state transitions or delivery semantics.
+
+For a local backend, Compose contains an optional Jaeger profile. It is not
+started in the normal stack:
+
+```powershell
+$env:OTEL_TRACING_ENABLED = "true"
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = "jaeger:4317"
+docker compose --profile tracing up --build
+```
+
+Open `http://localhost:16686` and inspect the `taskforge-producer` and
+`taskforge-worker` services. A normal job shows enqueue → claim → execute →
+acknowledge; a failure shows execution error plus retry/DLQ spans; a scheduled
+job shows schedule promotion before claim. Tracing introduces SDK/exporter
+overhead, so Task 12’s tracing-disabled benchmark measurements remain the
+authoritative baseline.
+
 ## API
 
 The producer listens on `:8080` by default. The worker observability server listens on `:8081` by default.
@@ -326,6 +390,45 @@ Worker-scaling batch, 48 successful jobs:
 
 Increasing from one to four workers produced roughly a 3× improvement. Eight workers improved throughput further, but with diminishing returns as Redis operations, synchronization, and local runtime overhead became a larger share. Retry/DLQ work is slower because it performs additional metadata and Redis queue-state transitions.
 
+## Performance engineering
+
+All numbers in this section are **local measurements**, not universal
+production-capacity guarantees. Task 12 remains the authoritative unoptimized
+baseline above. Task 16 CPU profiles showed that the hot paths were dominated
+by Redis/network coordination (`runtime.cgocall` and go-redis I/O), while JSON
+work was secondary. The normal successful worker path included an observational
+post-claim Redis `ZCARD` in addition to the state-transition operations.
+
+Task 17 removed only that synchronous worker-side `ZCARD`. It did not alter
+claiming, metadata transitions, priority, recovery, retries, DLQ, or
+acknowledgements. Queue-depth gauges remain Redis-authoritative because
+`/metrics` still pipelines fresh Redis `ZCARD`/`LLEN` reads when scraped.
+
+| Benchmark | Task 12 baseline | Task 17 optimized | Change |
+| --- | ---: | ---: | ---: |
+| Concurrent enqueue, 48 jobs | 472.6 jobs/sec | 484.2 jobs/sec | +2.45% |
+| Concurrent priority claims, 48 claims | 745.3 jobs/sec | 505.1 jobs/sec | -32.23% |
+| Worker scaling, 1 worker, 48 jobs | 167.8 jobs/sec | 194.5 jobs/sec | +15.91% |
+| Worker scaling, 4 workers, 48 jobs | 506.7 jobs/sec | 532.7 jobs/sec | **+5.13%** |
+| Worker scaling, 8 workers, 48 jobs | 647.5 jobs/sec | 611.9 jobs/sec | -5.50% |
+| Retry/DLQ, 16 jobs | 78.92 jobs/sec | 74.81 jobs/sec | -5.21% |
+| Scheduled promotion, 32 jobs | 575.7 jobs/sec | 509.3 jobs/sec | -11.53% |
+
+The four-worker end-to-end result—**506.7 → 532.7 jobs/sec (+5.13%)**—is the
+most relevant result because it executes the removed post-claim worker
+operation. Concurrent priority claims do not execute that worker-side path;
+retry/DLQ and scheduled promotion exercise different paths with extra Redis
+state transitions. Their one-run `-benchtime=1x` results, and the other small
+local workloads, are susceptible to host and Redis timing variability. They
+are not evidence that the targeted optimization changed those paths.
+
+The final engineering decision is to stop here. Removing the unnecessary
+round trip is low risk and produced a measurable end-to-end improvement.
+Further improvements—such as batching or consolidating metadata and queue
+transitions—would touch delivery-state boundaries and carry substantially more
+reliability and semantic risk than this measured gain justifies. Those changes
+should be designed, profiled, and reviewed as separate reliability work.
+
 ## Testing and CI
 
 The project includes unit tests, Redis-backed integration tests, Task 11 concurrent stress tests, scheduling/retry/DLQ coverage, and race-detector validation. Redis-backed tests use isolated logical databases and unique queue keys to avoid test interference.
@@ -362,7 +465,10 @@ GitHub Actions in `.github/workflows/ci.yml` checks formatting, runs Redis-backe
 - Redis is the central queue and state dependency.
 - Docker live verification is local; cloud credentials, TLS, a domain, and managed Redis are deliberately outside this repository.
 - Scheduled jobs with identical due timestamps have deterministic job-ID ordering before entering the priority queue.
-- There is no distributed tracing yet.
+- OpenTelemetry tracing is optional and exports asynchronously through OTLP;
+  exported spans can be dropped if the configured collector is unavailable or
+  the process exits before the batch processor flushes. Tracing does not close
+  the documented claim-to-metadata crash window.
 - Claiming into `task_processing` and changing metadata to `processing` are separate operations. A worker crash in that narrow interval can leave pending metadata with an in-flight entry that the current recovery guard does not promote. This is a known reliability gap to address in a future atomic state-transition improvement.
 
 ## Repository structure
