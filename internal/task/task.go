@@ -15,6 +15,7 @@ const (
 	StatusCompleted  Status = "completed"
 	StatusFailed     Status = "failed"
 	StatusRetrying   Status = "retrying"
+	StatusDead       Status = "dead"
 
 	DefaultPriority   = 0
 	DefaultMaxRetries = 3
@@ -31,6 +32,8 @@ type Task struct {
 	CreatedAt           time.Time              `json:"created_at"`
 	ScheduledAt         *time.Time             `json:"scheduled_at,omitempty"`
 	ProcessingStartedAt *time.Time             `json:"processing_started_at,omitempty"`
+	NextRetryAt         *time.Time             `json:"next_retry_at,omitempty"`
+	LastError           string                 `json:"last_error,omitempty"`
 }
 
 // NewID creates a randomly generated UUID version 4 without an external dependency.

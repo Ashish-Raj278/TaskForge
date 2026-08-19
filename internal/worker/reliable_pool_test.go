@@ -50,7 +50,7 @@ func TestProcessTaskAcknowledgesTerminalTasks(t *testing.T) {
 		wantStatus task.Status
 	}{
 		{name: "success", taskType: "generate_pdf", wantStatus: task.StatusCompleted},
-		{name: "application failure", taskType: "unsupported", wantStatus: task.StatusFailed},
+		{name: "application failure", taskType: "unsupported", wantStatus: task.StatusDead},
 	}
 
 	for _, test := range tests {
@@ -69,7 +69,7 @@ func TestProcessTaskAcknowledgesTerminalTasks(t *testing.T) {
 			}
 			t.Cleanup(func() { rdb.LRem(ctx, task.ProcessingQueue, 1, rawTask) })
 
-			pool := NewPool(rdb, queue, 1, time.Hour, log.New(io.Discard, "", 0))
+			pool := NewPool(rdb, queue, 1, time.Hour, DefaultRetryBaseDelay, log.New(io.Discard, "", 0))
 			pool.processTask(1, rawTask, claimedTask)
 
 			metadata, err := task.GetMetadata(ctx, rdb, queuedTask.ID)
@@ -109,7 +109,7 @@ func TestPoolConsumesTasksConcurrently(t *testing.T) {
 
 	poolContext, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool := NewPool(rdb, queue, 2, time.Hour, log.New(io.Discard, "", 0))
+	pool := NewPool(rdb, queue, 2, time.Hour, DefaultRetryBaseDelay, log.New(io.Discard, "", 0))
 	done := make(chan struct{})
 	go func() {
 		pool.Run(poolContext)

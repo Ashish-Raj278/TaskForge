@@ -17,7 +17,9 @@ import (
 const (
 	DefaultWorkerCount       = 3
 	DefaultVisibilityTimeout = 30 * time.Second
+	DefaultRetryBaseDelay    = 2 * time.Second
 	defaultPollTimeout       = time.Second
+	retrySchedulerInterval   = 500 * time.Millisecond
 )
 
 type Stats struct {
@@ -31,7 +33,9 @@ type Pool struct {
 	queue             string
 	workerCount       int
 	visibilityTimeout time.Duration
+	retryBaseDelay    time.Duration
 	logger            *log.Logger
+	execute           func(task.Task) error
 	queueLength       atomic.Int64
 	jobsDone          atomic.Int64
 	jobsFailed        atomic.Int64
@@ -55,12 +59,24 @@ func VisibilityTimeout(value string) time.Duration {
 	return timeout
 }
 
-func NewPool(rdb *redis.Client, queue string, workerCount int, visibilityTimeout time.Duration, logger *log.Logger) *Pool {
+// RetryBaseDelay returns the configured delay before the first retry, defaulting to two seconds.
+func RetryBaseDelay(value string) time.Duration {
+	delay, err := time.ParseDuration(value)
+	if err != nil || delay <= 0 {
+		return DefaultRetryBaseDelay
+	}
+	return delay
+}
+
+func NewPool(rdb *redis.Client, queue string, workerCount int, visibilityTimeout, retryBaseDelay time.Duration, logger *log.Logger) *Pool {
 	if workerCount < 1 {
 		workerCount = DefaultWorkerCount
 	}
 	if visibilityTimeout <= 0 {
 		visibilityTimeout = DefaultVisibilityTimeout
+	}
+	if retryBaseDelay <= 0 {
+		retryBaseDelay = DefaultRetryBaseDelay
 	}
 	if logger == nil {
 		logger = log.Default()
@@ -70,7 +86,9 @@ func NewPool(rdb *redis.Client, queue string, workerCount int, visibilityTimeout
 		queue:             queue,
 		workerCount:       workerCount,
 		visibilityTimeout: visibilityTimeout,
+		retryBaseDelay:    retryBaseDelay,
 		logger:            logger,
+		execute:           Process_Task,
 	}
 }
 
@@ -79,6 +97,8 @@ func (p *Pool) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go p.runRecovery(ctx, &wg)
+	wg.Add(1)
+	go p.runRetryScheduler(ctx, &wg)
 
 	for workerID := 1; workerID <= p.workerCount; workerID++ {
 		wg.Add(1)
@@ -127,34 +147,62 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 	}
 
 	p.logger.Printf("worker %d processing task %s (%s)", workerID, taskToExecute.ID, taskToExecute.Type)
-	if err := Process_Task(taskToExecute); err != nil {
+	if err := p.execute(taskToExecute); err != nil {
 		p.jobsFailed.Add(1)
-		failedTask, updateErr := task.MarkFailed(metadataContext, p.rdb, taskToExecute.ID)
+		if task.CanRetry(taskToExecute) {
+			retryAt := time.Now().UTC().Add(task.RetryDelay(p.retryBaseDelay, taskToExecute.Attempts))
+			retryingTask, scheduleErr := task.ScheduleRetry(metadataContext, p.rdb, rawTask, taskToExecute.ID, retryAt, err)
+			if scheduleErr != nil {
+				p.logger.Printf("worker %d could not schedule retry for task %s: %v", workerID, taskToExecute.ID, scheduleErr)
+				return
+			}
+			logger.LogFailure(retryingTask, err)
+			p.logger.Printf("worker %d scheduled retry for task %s at %s", workerID, taskToExecute.ID, retryAt.Format(time.RFC3339Nano))
+			return
+		}
+
+		failedTask, updateErr := task.MoveToDLQ(metadataContext, p.rdb, rawTask, taskToExecute.ID, err)
 		if updateErr != nil {
-			p.logger.Printf("worker %d could not mark task %s as failed: %v", workerID, taskToExecute.ID, updateErr)
+			p.logger.Printf("worker %d could not move task %s to the dead-letter queue: %v", workerID, taskToExecute.ID, updateErr)
 			return
 		}
 		logger.LogFailure(failedTask, err)
-		if ackErr := task.Acknowledge(metadataContext, p.rdb, rawTask); ackErr != nil {
-			p.logger.Printf("worker %d could not acknowledge failed task %s: %v", workerID, taskToExecute.ID, ackErr)
-			return
-		}
-		p.logger.Printf("worker %d failed task %s", workerID, taskToExecute.ID)
+		p.logger.Printf("worker %d dead-lettered task %s", workerID, taskToExecute.ID)
 		return
 	}
 
 	p.jobsDone.Add(1)
-	completedTask, err := task.MarkCompleted(metadataContext, p.rdb, taskToExecute.ID)
+	completedTask, err := task.MarkCompletedAndAcknowledge(metadataContext, p.rdb, rawTask, taskToExecute.ID)
 	if err != nil {
 		p.logger.Printf("worker %d could not mark task %s as completed: %v", workerID, taskToExecute.ID, err)
 		return
 	}
 	logger.LogSuccess(completedTask)
-	if err := task.Acknowledge(metadataContext, p.rdb, rawTask); err != nil {
-		p.logger.Printf("worker %d could not acknowledge completed task %s: %v", workerID, taskToExecute.ID, err)
-		return
-	}
 	p.logger.Printf("worker %d completed task %s", workerID, taskToExecute.ID)
+}
+
+func (p *Pool) runRetryScheduler(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(retrySchedulerInterval)
+	defer ticker.Stop()
+
+	p.logger.Println("retry scheduler started")
+	defer p.logger.Println("retry scheduler stopped")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			moved, err := task.MoveDueRetries(ctx, p.rdb, p.queue, time.Now().UTC())
+			if err != nil {
+				p.logger.Printf("retry scheduler error: %v", err)
+				continue
+			}
+			if moved > 0 {
+				p.logger.Printf("returned %d retry task(s) to the queue", moved)
+			}
+		}
+	}
 }
 
 func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
@@ -173,7 +221,7 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			recovered, err := task.RecoverAbandoned(context.Background(), p.rdb, p.queue, p.visibilityTimeout)
+			recovered, err := task.RecoverAbandoned(ctx, p.rdb, p.queue, p.visibilityTimeout)
 			if err != nil {
 				p.logger.Printf("processing recovery error: %v", err)
 				continue

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 var rdb *redis.Client
 
 var ctx = context.Background()
+
+const defaultDLQListLimit int64 = 100
 
 type enqueueRequest struct {
 	Type       string                 `json:"type"`
@@ -46,6 +49,8 @@ func main() {
 
 	http.HandleFunc("/enqueue", post_handler)
 	http.HandleFunc("/jobs/", getJobHandler)
+	http.HandleFunc("/dlq", getDLQHandler)
+	http.HandleFunc("/dlq/", retryDLQHandler)
 
 	log.Println("Starting the server on port ", PORT)
 
@@ -155,5 +160,67 @@ func getJobHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(queuedTask); err != nil {
 		log.Println("Could not encode job metadata:", err)
+	}
+}
+
+func getDLQHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET request accepted", http.StatusMethodNotAllowed)
+		return
+	}
+
+	limit := defaultDLQListLimit
+	if requestedLimit := r.URL.Query().Get("limit"); requestedLimit != "" {
+		parsedLimit, err := strconv.ParseInt(requestedLimit, 10, 64)
+		if err != nil || parsedLimit < 1 || parsedLimit > defaultDLQListLimit {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		limit = parsedLimit
+	}
+
+	deadTasks, err := task.ListDeadTasks(ctx, rdb, limit)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(deadTasks); err != nil {
+		log.Println("Could not encode dead-letter queue:", err)
+	}
+}
+
+func retryDLQHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST request accepted", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/dlq/")
+	if !strings.HasSuffix(path, "/retry") {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+	id := strings.TrimSuffix(path, "/retry")
+	if id == "" || strings.Contains(id, "/") {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	replayedTask, err := task.ReplayDeadTask(ctx, rdb, "task_queue", id)
+	if errors.Is(err, task.ErrNotFound) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "job not found"})
+		return
+	}
+	if err != nil {
+		http.Error(w, "Job is not dead", http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(replayedTask); err != nil {
+		log.Println("Could not encode replayed task:", err)
 	}
 }
