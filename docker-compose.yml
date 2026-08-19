@@ -39,9 +39,9 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       PORT_WORKER: "8081"
-      WORKER_COUNT: "4"
-      TASK_VISIBILITY_TIMEOUT: 30s
-      TASK_RETRY_BASE_DELAY: 2s
+      WORKER_COUNT: "${WORKER_COUNT:-4}"
+      TASK_VISIBILITY_TIMEOUT: "${TASK_VISIBILITY_TIMEOUT:-30s}"
+      TASK_RETRY_BASE_DELAY: "${TASK_RETRY_BASE_DELAY:-2s}"
     ports:
       - "8081:8081"
     depends_on:
