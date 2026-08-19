@@ -1,7 +1,7 @@
 package logger
 
 import (
-	"WorkQueue/internal/task"
+	"TaskForge/internal/task"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,7 +22,7 @@ func LogSuccess(cur_task task.Task) {
 		payload_str = []byte{}
 	}
 
-	text := "\n SUCCESS: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Retries left: " + fmt.Sprintf("%d", cur_task.Retries)
+	text := "\n SUCCESS: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Attempts: " + fmt.Sprintf("%d/%d", cur_task.Attempts, cur_task.MaxRetries)
 
 	if _, err := f.WriteString(text); err != nil {
 		log.Fatal("Error writing to the log file: ", err)
@@ -33,7 +33,7 @@ func LogSuccess(cur_task task.Task) {
 
 func LogFailure(cur_task task.Task, cur_err error) {
 
-	f, err := os.OpenFile("/WorkQueue/logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("/TaskForge/logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 
 	if err != nil {
 		log.Fatal("Error logging: ", err)
@@ -46,7 +46,7 @@ func LogFailure(cur_task task.Task, cur_err error) {
 		payload_str = []byte{}
 	}
 
-	text := "FAILURE: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Retries left: " + fmt.Sprintf("%d", cur_task.Retries) + "Error message: " + cur_err.Error()
+	text := "FAILURE: Task type: " + cur_task.Type + " Task payload: " + string(payload_str) + " Attempts: " + fmt.Sprintf("%d/%d", cur_task.Attempts, cur_task.MaxRetries) + " Error message: " + cur_err.Error()
 
 	if _, err := f.WriteString(text); err != nil {
 		log.Fatal("Error writing to the log file: ", err)

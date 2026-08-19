@@ -1,7 +1,7 @@
 package worker
 
 import (
-	"WorkQueue/internal/task"
+	"TaskForge/internal/task"
 	"time"
 
 	"fmt"
