@@ -4,7 +4,6 @@ import (
 	"TaskForge/internal/logger"
 	"TaskForge/internal/task"
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"strconv"
@@ -16,8 +15,9 @@ import (
 )
 
 const (
-	DefaultWorkerCount = 3
-	defaultPollTimeout = time.Second
+	DefaultWorkerCount       = 3
+	DefaultVisibilityTimeout = 30 * time.Second
+	defaultPollTimeout       = time.Second
 )
 
 type Stats struct {
@@ -27,13 +27,14 @@ type Stats struct {
 }
 
 type Pool struct {
-	rdb         *redis.Client
-	queue       string
-	workerCount int
-	logger      *log.Logger
-	queueLength atomic.Int64
-	jobsDone    atomic.Int64
-	jobsFailed  atomic.Int64
+	rdb               *redis.Client
+	queue             string
+	workerCount       int
+	visibilityTimeout time.Duration
+	logger            *log.Logger
+	queueLength       atomic.Int64
+	jobsDone          atomic.Int64
+	jobsFailed        atomic.Int64
 }
 
 // WorkerCount returns the configured worker count, defaulting to three for missing or invalid values.
@@ -45,19 +46,40 @@ func WorkerCount(value string) int {
 	return count
 }
 
-func NewPool(rdb *redis.Client, queue string, workerCount int, logger *log.Logger) *Pool {
+// VisibilityTimeout returns the configured lease duration, defaulting to 30 seconds for missing or invalid values.
+func VisibilityTimeout(value string) time.Duration {
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return DefaultVisibilityTimeout
+	}
+	return timeout
+}
+
+func NewPool(rdb *redis.Client, queue string, workerCount int, visibilityTimeout time.Duration, logger *log.Logger) *Pool {
 	if workerCount < 1 {
 		workerCount = DefaultWorkerCount
+	}
+	if visibilityTimeout <= 0 {
+		visibilityTimeout = DefaultVisibilityTimeout
 	}
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Pool{rdb: rdb, queue: queue, workerCount: workerCount, logger: logger}
+	return &Pool{
+		rdb:               rdb,
+		queue:             queue,
+		workerCount:       workerCount,
+		visibilityTimeout: visibilityTimeout,
+		logger:            logger,
+	}
 }
 
-// Run starts the configured workers and returns after they all stop.
+// Run starts the configured workers and recovery loop, returning after they all stop.
 func (p *Pool) Run(ctx context.Context) {
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go p.runRecovery(ctx, &wg)
+
 	for workerID := 1; workerID <= p.workerCount; workerID++ {
 		wg.Add(1)
 		go p.runWorker(ctx, workerID, &wg)
@@ -77,7 +99,8 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 		if ctx.Err() != nil {
 			return
 		}
-		result, err := p.rdb.BLPop(ctx, defaultPollTimeout, p.queue).Result()
+
+		rawTask, taskToExecute, err := task.Claim(ctx, p.rdb, p.queue, defaultPollTimeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -88,17 +111,13 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 			p.logger.Printf("worker %d stopped after Redis error: %v", workerID, err)
 			return
 		}
+
 		p.updateQueueLength(workerID)
-		var taskToExecute task.Task
-		if err := json.Unmarshal([]byte(result[1]), &taskToExecute); err != nil {
-			p.logger.Printf("worker %d could not decode queued task: %v", workerID, err)
-			continue
-		}
-		p.processTask(workerID, taskToExecute)
+		p.processTask(workerID, rawTask, taskToExecute)
 	}
 }
 
-func (p *Pool) processTask(workerID int, taskToExecute task.Task) {
+func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task) {
 	metadataContext := context.Background()
 	var err error
 	taskToExecute, err = task.StartProcessing(metadataContext, p.rdb, taskToExecute.ID)
@@ -106,26 +125,64 @@ func (p *Pool) processTask(workerID int, taskToExecute task.Task) {
 		p.logger.Printf("worker %d could not mark task %s as processing: %v", workerID, taskToExecute.ID, err)
 		return
 	}
+
 	p.logger.Printf("worker %d processing task %s (%s)", workerID, taskToExecute.ID, taskToExecute.Type)
 	if err := Process_Task(taskToExecute); err != nil {
 		p.jobsFailed.Add(1)
 		failedTask, updateErr := task.MarkFailed(metadataContext, p.rdb, taskToExecute.ID)
 		if updateErr != nil {
 			p.logger.Printf("worker %d could not mark task %s as failed: %v", workerID, taskToExecute.ID, updateErr)
-			failedTask = taskToExecute
+			return
 		}
 		logger.LogFailure(failedTask, err)
-		p.logger.Printf("worker %d failed task %s: %v", workerID, taskToExecute.ID, err)
+		if ackErr := task.Acknowledge(metadataContext, p.rdb, rawTask); ackErr != nil {
+			p.logger.Printf("worker %d could not acknowledge failed task %s: %v", workerID, taskToExecute.ID, ackErr)
+			return
+		}
+		p.logger.Printf("worker %d failed task %s", workerID, taskToExecute.ID)
 		return
 	}
+
 	p.jobsDone.Add(1)
 	completedTask, err := task.MarkCompleted(metadataContext, p.rdb, taskToExecute.ID)
 	if err != nil {
 		p.logger.Printf("worker %d could not mark task %s as completed: %v", workerID, taskToExecute.ID, err)
-		completedTask = taskToExecute
+		return
 	}
 	logger.LogSuccess(completedTask)
+	if err := task.Acknowledge(metadataContext, p.rdb, rawTask); err != nil {
+		p.logger.Printf("worker %d could not acknowledge completed task %s: %v", workerID, taskToExecute.ID, err)
+		return
+	}
 	p.logger.Printf("worker %d completed task %s", workerID, taskToExecute.ID)
+}
+
+func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	interval := p.visibilityTimeout / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	p.logger.Printf("processing recovery started with visibility timeout %s", p.visibilityTimeout)
+	defer p.logger.Println("processing recovery stopped")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			recovered, err := task.RecoverAbandoned(context.Background(), p.rdb, p.queue, p.visibilityTimeout)
+			if err != nil {
+				p.logger.Printf("processing recovery error: %v", err)
+				continue
+			}
+			if recovered > 0 {
+				p.logger.Printf("recovered %d abandoned task(s)", recovered)
+			}
+		}
+	}
 }
 
 func (p *Pool) updateQueueLength(workerID int) {

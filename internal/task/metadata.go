@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -58,18 +59,22 @@ func StartProcessing(ctx context.Context, rdb *redis.Client, id string) (Task, e
 	return updateMetadata(ctx, rdb, id, func(task *Task) {
 		task.Status = StatusProcessing
 		task.Attempts++
+		now := time.Now().UTC()
+		task.ProcessingStartedAt = &now
 	})
 }
 
 func MarkCompleted(ctx context.Context, rdb *redis.Client, id string) (Task, error) {
 	return updateMetadata(ctx, rdb, id, func(task *Task) {
 		task.Status = StatusCompleted
+		task.ProcessingStartedAt = nil
 	})
 }
 
 func MarkFailed(ctx context.Context, rdb *redis.Client, id string) (Task, error) {
 	return updateMetadata(ctx, rdb, id, func(task *Task) {
 		task.Status = StatusFailed
+		task.ProcessingStartedAt = nil
 	})
 }
 

@@ -33,7 +33,7 @@ func LogSuccess(cur_task task.Task) {
 
 func LogFailure(cur_task task.Task, cur_err error) {
 
-	f, err := os.OpenFile("/TaskForge/logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 
 	if err != nil {
 		log.Fatal("Error logging: ", err)

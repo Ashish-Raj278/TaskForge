@@ -21,15 +21,16 @@ const (
 )
 
 type Task struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Payload     map[string]interface{} `json:"payload"`
-	Status      Status                 `json:"status"`
-	Priority    int                    `json:"priority"`
-	MaxRetries  int                    `json:"max_retries"`
-	Attempts    int                    `json:"attempts"`
-	CreatedAt   time.Time              `json:"created_at"`
-	ScheduledAt *time.Time             `json:"scheduled_at,omitempty"`
+	ID                  string                 `json:"id"`
+	Type                string                 `json:"type"`
+	Payload             map[string]interface{} `json:"payload"`
+	Status              Status                 `json:"status"`
+	Priority            int                    `json:"priority"`
+	MaxRetries          int                    `json:"max_retries"`
+	Attempts            int                    `json:"attempts"`
+	CreatedAt           time.Time              `json:"created_at"`
+	ScheduledAt         *time.Time             `json:"scheduled_at,omitempty"`
+	ProcessingStartedAt *time.Time             `json:"processing_started_at,omitempty"`
 }
 
 // NewID creates a randomly generated UUID version 4 without an external dependency.

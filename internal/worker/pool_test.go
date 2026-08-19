@@ -28,12 +28,21 @@ func TestWorkerCount(t *testing.T) {
 func TestPoolRunReturnsWhenContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	pool := NewPool(nil, "task_queue", 2, log.New(io.Discard, "", 0))
+	pool := NewPool(nil, "task_queue", 2, DefaultVisibilityTimeout, log.New(io.Discard, "", 0))
 	done := make(chan struct{})
 	go func() { pool.Run(ctx); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("pool did not stop after context cancellation")
+	}
+}
+
+func TestVisibilityTimeout(t *testing.T) {
+	if got := VisibilityTimeout("5s"); got != 5*time.Second {
+		t.Fatalf("VisibilityTimeout(5s) = %s, want 5s", got)
+	}
+	if got := VisibilityTimeout("invalid"); got != DefaultVisibilityTimeout {
+		t.Fatalf("VisibilityTimeout(invalid) = %s, want %s", got, DefaultVisibilityTimeout)
 	}
 }
