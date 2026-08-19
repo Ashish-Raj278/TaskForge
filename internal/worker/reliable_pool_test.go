@@ -148,6 +148,38 @@ func TestPoolConsumesTasksConcurrently(t *testing.T) {
 	}
 }
 
+func TestPanicInTaskHandlerFollowsFailurePath(t *testing.T) {
+	ctx := context.Background()
+	rdb := integrationRedis(t)
+	queuedTask := integrationTask(t, "panic")
+	queuedTask.MaxRetries = 1
+	queue := fmt.Sprintf("task_test_queue:%s", queuedTask.ID)
+	t.Cleanup(func() {
+		rdb.Del(ctx, queue, task.MetadataKey(queuedTask.ID))
+		rdb.LRem(ctx, task.DeadLetterQueue, 0, queuedTask.ID)
+	})
+	if _, err := task.StoreAndEnqueue(ctx, rdb, queue, queuedTask); err != nil {
+		t.Fatal(err)
+	}
+	rawTask, claimedTask, err := task.Claim(ctx, rdb, queue, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := NewPool(rdb, queue, 1, time.Hour, DefaultRetryBaseDelay, log.New(io.Discard, "", 0))
+	pool.execute = func(task.Task) error { panic("handler bug") }
+	pool.processTask(1, rawTask, claimedTask)
+	metadata, err := task.GetMetadata(ctx, rdb, queuedTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Status != task.StatusDead || metadata.LastError == "" {
+		t.Fatalf("panic task metadata = %#v", metadata)
+	}
+	if containsTask(ctx, rdb, task.ProcessingQueue, rawTask) {
+		t.Fatal("panic task remained processing")
+	}
+}
+
 func containsTask(ctx context.Context, rdb *redis.Client, queue, rawTask string) bool {
 	for _, task := range rdb.LRange(ctx, queue, 0, -1).Val() {
 		if task == rawTask {

@@ -6,6 +6,7 @@ import (
 	"TaskForge/internal/task"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strconv"
 	"sync"
@@ -22,6 +23,7 @@ const (
 	defaultPollTimeout        = time.Second
 	retrySchedulerInterval    = 500 * time.Millisecond
 	scheduleSchedulerInterval = 500 * time.Millisecond
+	redisFailureBackoff       = time.Second
 )
 
 type Stats struct {
@@ -130,6 +132,9 @@ func (p *Pool) runScheduleScheduler(ctx context.Context, wg *sync.WaitGroup) {
 			moved, err := task.MoveDueScheduled(ctx, p.rdb, p.queue, time.Now().UTC())
 			if err != nil {
 				p.logger.Printf("scheduled-job scheduler error: %v", err)
+				if !waitForContext(ctx, redisFailureBackoff) {
+					return
+				}
 				continue
 			}
 			if moved > 0 {
@@ -173,12 +178,15 @@ func (p *Pool) runWorker(ctx context.Context, workerID int, wg *sync.WaitGroup) 
 				}
 				continue
 			}
-			p.logger.Printf("worker %d stopped after Redis error: %v", workerID, err)
-			return
+			p.logger.Printf("worker %d Redis error: %v", workerID, err)
+			if !waitForContext(ctx, redisFailureBackoff) {
+				return
+			}
+			continue
 		}
 
 		p.updateQueueLength(workerID)
-		logger.Job("job_claimed", taskToExecute, nil)
+		logger.JobForWorker("job_claimed", workerID, taskToExecute, nil, 0)
 		p.processTask(workerID, rawTask, taskToExecute)
 	}
 }
@@ -191,14 +199,14 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 		p.logger.Printf("worker %d could not mark task %s as processing: %v", workerID, taskToExecute.ID, err)
 		return
 	}
-	logger.Job("job_started", taskToExecute, nil)
+	logger.JobForWorker("job_started", workerID, taskToExecute, nil, 0)
 	executionStarted := time.Now()
 
 	p.logger.Printf("worker %d processing task %s (%s)", workerID, taskToExecute.ID, taskToExecute.Type)
-	if err := p.execute(taskToExecute); err != nil {
+	if err := executeSafely(p.execute, taskToExecute); err != nil {
 		p.jobsFailed.Add(1)
 		p.metrics.Failed()
-		logger.JobDuration("job_failed", taskToExecute, err, time.Since(executionStarted))
+		logger.JobForWorker("job_failed", workerID, taskToExecute, err, time.Since(executionStarted))
 		if task.CanRetry(taskToExecute) {
 			retryAt := time.Now().UTC().Add(task.RetryDelay(p.retryBaseDelay, taskToExecute.Attempts))
 			retryingTask, scheduleErr := task.ScheduleRetry(metadataContext, p.rdb, rawTask, taskToExecute.ID, retryAt, err)
@@ -207,7 +215,7 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 				return
 			}
 			p.metrics.Retried()
-			logger.Job("job_retry_scheduled", retryingTask, err)
+			logger.JobForWorker("job_retry_scheduled", workerID, retryingTask, err, time.Since(executionStarted))
 			p.logger.Printf("worker %d scheduled retry for task %s at %s", workerID, taskToExecute.ID, retryAt.Format(time.RFC3339Nano))
 			return
 		}
@@ -218,7 +226,7 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 			return
 		}
 		p.metrics.Dead()
-		logger.JobDuration("job_dead", failedTask, err, time.Since(executionStarted))
+		logger.JobForWorker("job_dead", workerID, failedTask, err, time.Since(executionStarted))
 		p.logger.Printf("worker %d dead-lettered task %s", workerID, taskToExecute.ID)
 		return
 	}
@@ -230,7 +238,7 @@ func (p *Pool) processTask(workerID int, rawTask string, taskToExecute task.Task
 		return
 	}
 	p.metrics.Completed()
-	logger.JobDuration("job_completed", completedTask, nil, time.Since(executionStarted))
+	logger.JobForWorker("job_completed", workerID, completedTask, nil, time.Since(executionStarted))
 	p.logger.Printf("worker %d completed task %s", workerID, taskToExecute.ID)
 }
 
@@ -249,6 +257,9 @@ func (p *Pool) runRetryScheduler(ctx context.Context, wg *sync.WaitGroup) {
 			moved, err := task.MoveDueRetries(ctx, p.rdb, p.queue, time.Now().UTC())
 			if err != nil {
 				p.logger.Printf("retry scheduler error: %v", err)
+				if !waitForContext(ctx, redisFailureBackoff) {
+					return
+				}
 				continue
 			}
 			if moved > 0 {
@@ -277,6 +288,9 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 			recovered, err := task.RecoverAbandoned(ctx, p.rdb, p.queue, p.visibilityTimeout)
 			if err != nil {
 				p.logger.Printf("processing recovery error: %v", err)
+				if !waitForContext(ctx, redisFailureBackoff) {
+					return
+				}
 				continue
 			}
 			if recovered > 0 {
@@ -285,6 +299,26 @@ func (p *Pool) runRecovery(ctx context.Context, wg *sync.WaitGroup) {
 				p.logger.Printf("recovered %d abandoned task(s)", recovered)
 			}
 		}
+	}
+}
+
+func executeSafely(execute func(task.Task) error, queuedTask task.Task) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("task handler panic: %v", recovered)
+		}
+	}()
+	return execute(queuedTask)
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

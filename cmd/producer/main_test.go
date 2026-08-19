@@ -24,6 +24,28 @@ func TestEnqueueRejectsInvalidScheduledAt(t *testing.T) {
 	}
 }
 
+func TestEnqueueRejectsMalformedAndOversizedBodies(t *testing.T) {
+	malformed := httptest.NewRecorder()
+	post_handler(malformed, httptest.NewRequest(http.MethodPost, "/enqueue", strings.NewReader(`{"type":`)))
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed request status = %d, want 400", malformed.Code)
+	}
+
+	overlarge := httptest.NewRecorder()
+	body := `{"type":"generate_pdf","payload":{"data":"` + strings.Repeat("x", maxEnqueueBodyBytes) + `"}}`
+	post_handler(overlarge, httptest.NewRequest(http.MethodPost, "/enqueue", strings.NewReader(body)))
+	if overlarge.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized request status = %d, want 413", overlarge.Code)
+	}
+}
+
+func TestProducerPortDefault(t *testing.T) {
+	t.Setenv("PORT_PRODUCER", "")
+	if got := producerPort(); got != "8080" {
+		t.Fatalf("producerPort = %s, want 8080", got)
+	}
+}
+
 func producerRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	url := os.Getenv("REDIS_URL")

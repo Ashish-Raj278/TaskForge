@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -24,7 +27,10 @@ var metrics = observability.NewMetrics()
 
 var ctx = context.Background()
 
-const defaultDLQListLimit int64 = 100
+const (
+	defaultDLQListLimit int64 = 100
+	maxEnqueueBodyBytes       = 1 << 20
+)
 
 type enqueueRequest struct {
 	Type        string                 `json:"type"`
@@ -45,28 +51,55 @@ func connectRedis() *redis.Client {
 }
 
 func main() {
-	var PORT string = ":" + os.Getenv("PORT_PRODUCER")
-
 	godotenv.Load()
-
 	rdb = connectRedis()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Printf("producer Redis close error: %v", err)
+		}
+	}()
 
-	http.HandleFunc("/enqueue", post_handler)
-	http.HandleFunc("/jobs/", getJobHandler)
-	http.HandleFunc("/dlq", getDLQHandler)
-	http.HandleFunc("/dlq/", retryDLQHandler)
-	http.HandleFunc("/metrics", observability.MetricsHandler(rdb, metrics))
-	http.HandleFunc("/health", observability.HealthHandler(rdb))
-	http.HandleFunc("/ready", observability.ReadyHandler(rdb))
-
-	log.Println("Starting the server on port ", PORT)
-
-	err := http.ListenAndServe(PORT, nil)
-
-	if err != nil {
-		log.Fatal("error starting the server")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/enqueue", post_handler)
+	mux.HandleFunc("/jobs/", getJobHandler)
+	mux.HandleFunc("/dlq", getDLQHandler)
+	mux.HandleFunc("/dlq/", retryDLQHandler)
+	mux.HandleFunc("/metrics", observability.MetricsHandler(rdb, metrics))
+	mux.HandleFunc("/health", observability.HealthHandler(rdb))
+	mux.HandleFunc("/ready", observability.ReadyHandler(rdb))
+	server := &http.Server{
+		Addr:              ":" + producerPort(),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+	serverContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("producer HTTP server error: %v", err)
+		}
+	}()
 
+	log.Printf("producer server started on %s", server.Addr)
+	<-serverContext.Done()
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		log.Printf("producer HTTP server shutdown error: %v", err)
+	}
+	<-serverDone
+}
+
+func producerPort() string {
+	if port := os.Getenv("PORT_PRODUCER"); port != "" {
+		return port
+	}
+	return "8080"
 }
 
 func post_handler(w http.ResponseWriter, r *http.Request) {
@@ -76,12 +109,24 @@ func post_handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnqueueBodyBytes)
+	defer r.Body.Close()
 
 	// Read the request body
 	var request enqueueRequest
-	err := json.NewDecoder(r.Body).Decode(&request)
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&request)
 
 	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}

@@ -42,7 +42,14 @@ func main() {
 	mux.HandleFunc("/metrics", observability.MetricsHandler(rdb, pool.Metrics()))
 	mux.HandleFunc("/health", observability.HealthHandler(rdb))
 	mux.HandleFunc("/ready", observability.ReadyHandler(rdb))
-	server := &http.Server{Addr: ":" + os.Getenv("PORT_WORKER"), Handler: mux}
+	server := &http.Server{
+		Addr:              ":" + workerPort(),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
@@ -65,4 +72,11 @@ func main() {
 		log.Printf("Redis close error: %v", err)
 	}
 	log.Println("worker shutdown complete")
+}
+
+func workerPort() string {
+	if port := os.Getenv("PORT_WORKER"); port != "" {
+		return port
+	}
+	return "8081"
 }

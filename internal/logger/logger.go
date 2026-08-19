@@ -18,6 +18,7 @@ type event struct {
 	Event     string      `json:"event"`
 	JobID     string      `json:"job_id,omitempty"`
 	JobType   string      `json:"job_type,omitempty"`
+	WorkerID  int         `json:"worker_id,omitempty"`
 	Status    task.Status `json:"status,omitempty"`
 	Priority  int         `json:"priority,omitempty"`
 	Attempts  int         `json:"attempts,omitempty"`
@@ -28,6 +29,15 @@ type event struct {
 
 func Job(name string, queuedTask task.Task, err error) {
 	JobDuration(name, queuedTask, err, 0)
+}
+
+func JobForWorker(name string, workerID int, queuedTask task.Task, err error, duration time.Duration) {
+	e := event{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Level: "info", Event: name, JobID: queuedTask.ID, JobType: queuedTask.Type, WorkerID: workerID, Status: queuedTask.Status, Priority: queuedTask.Priority, Attempts: queuedTask.Attempts, Duration: duration.Milliseconds()}
+	if err != nil {
+		e.Level = "error"
+		e.Error = err.Error()
+	}
+	write(e)
 }
 
 func JobDuration(name string, queuedTask task.Task, err error, duration time.Duration) {
